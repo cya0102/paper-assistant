@@ -10,6 +10,8 @@ from paper_agent.domain.reading import ReadPaperRequest, ReadPaperResult
 from paper_agent.domain.retrieval import MetadataFilter, SearchRequest, SearchScope
 from paper_agent.reading.service import ReadPaperService
 from paper_agent.retrieval.advanced import KnowledgeSearch
+from paper_agent.domain.comparison import PaperComparisonResult
+from paper_agent.research_graph.service import EvidenceBackedComparisonService
 
 
 class SearchKnowledgeToolAdapter:
@@ -209,3 +211,117 @@ class ReadPaperToolAdapter:
             "elements": elements,
             "evidence": evidence,
         }
+
+
+class ComparePapersToolAdapter:
+    def __init__(
+        self, service: EvidenceBackedComparisonService, project_id: UUID
+    ) -> None:
+        self._service = service
+        self._project_id = project_id
+
+    def contract(self) -> ToolContract:
+        return ToolContract(
+            name="compare_papers",
+            description=(
+                "比较至少两篇论文的结构化 Profile/Claim；只返回带来源证据的比较项，"
+                "证据不足的维度会明确拒绝。"
+            ),
+            strict=False,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "paper_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "format": "uuid"},
+                        "minItems": 2,
+                        "maxItems": 20,
+                    }
+                },
+                "required": ["paper_ids"],
+                "additionalProperties": False,
+            },
+            handler=self.execute,
+        )
+
+    def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        paper_ids = tuple(UUID(str(value)) for value in arguments["paper_ids"])
+        return self._serialize(self._service.compare(self._project_id, paper_ids))
+
+    @staticmethod
+    def _serialize(result: PaperComparisonResult) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "project_id": str(result.project_id),
+            "paper_ids": [str(value) for value in result.paper_ids],
+            "status": result.status.value,
+            "reason": result.reason,
+            "derivation": {
+                "method": result.derivation_method,
+                "generator_version": result.generator_version,
+                "schema_version": result.schema_version,
+                "model_name": None,
+                "prompt_version": None,
+            },
+            "dimensions": [
+                {
+                    "name": dimension.name.value,
+                    "directly_comparable": dimension.directly_comparable,
+                    "non_comparable_reason": dimension.non_comparable_reason,
+                    "cells": [
+                        {
+                            "paper_id": str(cell.paper_id),
+                            "paper_title": cell.paper_title,
+                            "status": cell.status.value,
+                            "normalized_value": cell.normalized_value,
+                            "raw_description": cell.raw_description,
+                            "directly_comparable": cell.directly_comparable,
+                            "non_comparable_reason": cell.non_comparable_reason,
+                            "confidence": cell.confidence,
+                            "review_status": cell.review_status.value,
+                            "evidence": [
+                                {
+                                    "citation": f"E{int(link.evidence_id.hex[:12], 16)}",
+                                    "evidence_id": str(link.evidence_id),
+                                    "paper_id": str(link.paper_id),
+                                    "version_id": str(link.version_id),
+                                    "section_id": str(link.section_id),
+                                    "chunk_id": str(link.chunk_id),
+                                    "element_id": (
+                                        str(link.element_id)
+                                        if link.element_id is not None
+                                        else None
+                                    ),
+                                    "pages": [link.page_start, link.page_end],
+                                    "source_block_ids": list(link.source_block_ids),
+                                    "evidence_text": link.evidence_text,
+                                    "relation_to_target": link.relation_to_target.value,
+                                    "evidence_kind": link.evidence_kind.value,
+                                    "confidence": link.confidence,
+                                }
+                                for link in cell.evidence_links
+                            ],
+                        }
+                        for cell in dimension.cells
+                    ],
+                }
+                for dimension in result.dimensions
+            ],
+        }
+        flattened: dict[str, dict[str, Any]] = {}
+        for dimension in payload["dimensions"]:
+            for cell in dimension["cells"]:
+                for evidence in cell["evidence"]:
+                    evidence_id = str(evidence["evidence_id"])
+                    flattened.setdefault(
+                        evidence_id,
+                        {
+                            **evidence,
+                            "paper_title": cell["paper_title"],
+                            "section_path": f"Research Graph > {dimension['name']}",
+                            "page_start": evidence["pages"][0],
+                            "page_end": evidence["pages"][1],
+                            "text": evidence["evidence_text"],
+                        },
+                    )
+        payload["evidence"] = list(flattened.values())
+        return payload

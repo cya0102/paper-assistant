@@ -1,12 +1,12 @@
 # Paper Agent
 
 Paper Agent provides deterministic PDF ingestion, traceable semantic chunks,
-hierarchical hybrid retrieval, precise paper reading, and a recoverable model
-tool loop with Redis session state and PostgreSQL interaction memory.
+hierarchical hybrid retrieval, precise paper reading, a recoverable model tool
+loop, and an evidence-first Research Graph for structured paper comparison.
 
 The technical source of truth is `paper-agent-technical-spec.md`.
 
-## Implemented scope through Phase 3
+## Implemented scope through Research Graph Foundation
 
 - Separate `File`, `Paper`, and `PaperVersion` identities.
 - Multiple project-relative file locations for one SHA-256 binary identity.
@@ -45,11 +45,20 @@ The technical source of truth is `paper-agent-technical-spec.md`.
 - OpenAI stateful Responses, Xiaomi MiMo stateless Responses, OpenAI Embedding,
   and optional Cross-Encoder providers.
 - `search`, `read`, and `ask` CLI commands.
+- Versioned, queryable `PaperProfile` fields instead of an opaque Profile JSON blob.
+- Claim, ResearchEntity, typed Paper/Entity Relation, and polymorphic EvidenceLink models.
+- Claim–Evidence entailment boundary with an offline conservative baseline.
+- Project-scoped Research Graph Repository with active/superseded history and relation deduplication.
+- Deterministic offline PaperProfile extraction from existing Section-aware Chunks.
+- Evidence-backed structured comparison with explicit `insufficient_evidence` cells.
+- Agent `compare_papers` Tool and offline `profile-extract` / `compare` CLI commands.
 - Derived structure state bound to the exact canonical Parsed Document hash.
 - Section-bound Notes survive structure replacement through `ON DELETE SET NULL`.
 
 The default ingestion/search path remains offline. Model API credentials are only
 required for `ask` or when explicitly selecting an online Embedding provider.
+Research Graph extraction and comparison also use offline deterministic baselines
+by default.
 
 Use Xiaomi MiMo for the Agent loop without changing the embedding provider:
 
@@ -90,6 +99,8 @@ uv run paper-agent init --root /path/to/project
 uv run paper-agent ingest --root /path/to/project papers/
 uv run paper-agent status --root /path/to/project
 uv run paper-agent search --root /path/to/project 'codebook construction'
+uv run paper-agent profile-extract --root /path/to/project PAPER_ID
+uv run paper-agent compare --root /path/to/project PAPER_ID_A PAPER_ID_B
 ```
 
 Use `--force-reindex` to regenerate parsing and all current derived data. Parser,
@@ -117,3 +128,31 @@ result = service.search_knowledge(
     SearchRequest(query="How is the codebook built?", scope=SearchScope(project_id=project_id))
 )
 ```
+
+Build and compare Research Graph profiles without an LLM:
+
+```python
+from paper_agent.application import (
+    build_comparison_service,
+    build_research_graph_service,
+)
+
+graph = build_research_graph_service(database_url=database_url)
+graph.extract_profile(project_id, first_paper_id)
+graph.extract_profile(project_id, second_paper_id)
+
+comparison = build_comparison_service(database_url=database_url).compare(
+    project_id,
+    (first_paper_id, second_paper_id),
+)
+print(comparison.status.value)
+```
+
+Every non-empty comparison cell carries EvidenceLink records back to the exact
+PaperVersion, Section, Chunk, page range, source blocks, and evidence text. Missing
+Profile/Claim evidence produces an explicit refusal cell rather than generated text.
+
+The full staged plan is in
+[`docs/research-graph-roadmap.md`](docs/research-graph-roadmap.md). The delivered
+vertical slice is summarized in
+[`docs/Phase4阶段总结.md`](docs/Phase4阶段总结.md).

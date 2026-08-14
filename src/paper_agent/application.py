@@ -24,7 +24,11 @@ from paper_agent.retrieval.advanced import (
 from paper_agent.reading import ReadPaperService
 from paper_agent.agent import AgentRuntime, ToolRegistry
 from paper_agent.agent.context_builder import ToolEvidenceCitationFormatter
-from paper_agent.agent.tool_adapters import ReadPaperToolAdapter, SearchKnowledgeToolAdapter
+from paper_agent.agent.tool_adapters import (
+    ComparePapersToolAdapter,
+    ReadPaperToolAdapter,
+    SearchKnowledgeToolAdapter,
+)
 from paper_agent.memory import RedisCheckpointStore, RedisSessionStore
 from paper_agent.agent.ports import LanguageModel
 from paper_agent.providers import (
@@ -40,6 +44,15 @@ from paper_agent.storage.postgres.search_repository import SqlAlchemySearchRepos
 from paper_agent.storage.postgres.read_repository import SqlAlchemyPaperReadRepository
 from paper_agent.storage.postgres.neighbor_repository import SqlAlchemyNeighborRepository
 from paper_agent.storage.postgres.memory_repository import SqlAlchemyMemoryRepository
+from paper_agent.storage.postgres.research_graph_repository import (
+    SqlAlchemyResearchGraphRepository,
+)
+from paper_agent.research_graph import (
+    EvidenceBackedComparisonService,
+    LexicalEntailmentJudge,
+    ResearchGraphService,
+    RuleBasedPaperProfileExtractor,
+)
 
 
 def build_ingestion_pipeline(
@@ -89,6 +102,22 @@ def build_read_paper_service(*, database_url: str) -> ReadPaperService:
     return ReadPaperService(SqlAlchemyPaperReadRepository(factory))
 
 
+def build_research_graph_service(*, database_url: str) -> ResearchGraphService:
+    engine = create_engine(database_url, pool_pre_ping=True)
+    factory = sessionmaker(engine, class_=Session, expire_on_commit=False)
+    return ResearchGraphService(
+        SqlAlchemyResearchGraphRepository(factory),
+        RuleBasedPaperProfileExtractor(),
+        LexicalEntailmentJudge(),
+    )
+
+
+def build_comparison_service(*, database_url: str) -> EvidenceBackedComparisonService:
+    engine = create_engine(database_url, pool_pre_ping=True)
+    factory = sessionmaker(engine, class_=Session, expire_on_commit=False)
+    return EvidenceBackedComparisonService(SqlAlchemyResearchGraphRepository(factory))
+
+
 def build_agent_runtime(
     *,
     project_id: UUID,
@@ -100,6 +129,11 @@ def build_agent_runtime(
     tools = ToolRegistry()
     tools.register(SearchKnowledgeToolAdapter(build_search_knowledge_service(database_url=database_url), project_id).contract())
     tools.register(ReadPaperToolAdapter(build_read_paper_service(database_url=database_url), project_id).contract())
+    tools.register(
+        ComparePapersToolAdapter(
+            build_comparison_service(database_url=database_url), project_id
+        ).contract()
+    )
     redis_client: Redis = Redis.from_url(redis_url, decode_responses=True)
     engine = create_engine(database_url, pool_pre_ping=True)
     memory_factory = sessionmaker(engine, class_=Session, expire_on_commit=False)

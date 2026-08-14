@@ -22,5 +22,7 @@ def test_cli_help_is_available(capsys) -> None:
         main(["--help"])
 
     assert exit_info.value.code == 0
-    assert "Incrementally ingest local PDFs" in capsys.readouterr().out
-
+    output = capsys.readouterr().out
+    assert "Incrementally ingest local PDFs" in output
+    assert "profile-extract" in output
+    assert "compare" in output

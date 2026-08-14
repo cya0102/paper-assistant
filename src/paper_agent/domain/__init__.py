@@ -22,6 +22,19 @@ from paper_agent.domain.retrieval import (
     SearchRequest,
     SearchScope,
 )
+from paper_agent.domain.research_graph import (
+    Claim,
+    EvidenceLink,
+    PaperProfile,
+    PaperProfileFieldValue,
+    PaperRelation,
+    ResearchEntity,
+)
+from paper_agent.domain.comparison import (
+    ComparisonCell,
+    ComparisonDimension,
+    PaperComparisonResult,
+)
 
 __all__ = [
     "CanonicalParsedDocument",
@@ -50,4 +63,13 @@ __all__ = [
     "SearchKnowledgeResult",
     "SearchRequest",
     "SearchScope",
+    "Claim",
+    "ComparisonCell",
+    "ComparisonDimension",
+    "EvidenceLink",
+    "PaperComparisonResult",
+    "PaperProfile",
+    "PaperProfileFieldValue",
+    "PaperRelation",
+    "ResearchEntity",
 ]

@@ -9,10 +9,13 @@ from uuid import UUID, uuid4
 
 from paper_agent.application import (
     build_agent_runtime,
+    build_comparison_service,
     build_ingestion_pipeline,
     build_read_paper_service,
+    build_research_graph_service,
     build_search_knowledge_service,
 )
+from paper_agent.agent.tool_adapters import ComparePapersToolAdapter
 from paper_agent.database import database_status, upgrade_database
 from paper_agent.domain.ingestion import IngestionRequest
 from paper_agent.domain.enums import ElementType
@@ -37,6 +40,10 @@ def main(argv: list[str] | None = None) -> int:
             return _read(args)
         if args.command == "ask":
             return _ask(args)
+        if args.command == "profile-extract":
+            return _profile_extract(args)
+        if args.command == "compare":
+            return _compare(args)
         if args.command == "db-upgrade":
             upgrade_database(_database_url(args.database_url))
             print("Database upgraded to head.")
@@ -85,6 +92,19 @@ def _build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--redis-url")
     ask.add_argument("--model")
     ask.add_argument("--provider", choices=("openai", "mimo"))
+    profile = subparsers.add_parser(
+        "profile-extract", help="Extract an offline evidence-backed PaperProfile"
+    )
+    _root_argument(profile)
+    _database_argument(profile)
+    profile.add_argument("paper_id", type=UUID)
+    profile.add_argument("--version-id", type=UUID)
+    compare = subparsers.add_parser(
+        "compare", help="Compare evidence-backed Profiles and Claims"
+    )
+    _root_argument(compare)
+    _database_argument(compare)
+    compare.add_argument("paper_ids", nargs="+", type=UUID)
     upgrade = subparsers.add_parser("db-upgrade", help="Apply all database migrations")
     _database_argument(upgrade)
     return parser
@@ -146,7 +166,10 @@ def _ingest(args: argparse.Namespace) -> int:
 def _status(args: argparse.Namespace) -> int:
     root = args.root.resolve()
     manifest = ProjectManifestStore(root).load()
-    payload = {"project_id": str(manifest.project_id), **database_status(_database_url(args.database_url))}
+    payload = {
+        "project_id": str(manifest.project_id),
+        **database_status(_database_url(args.database_url), manifest.project_id),
+    }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
@@ -273,6 +296,59 @@ def _ask(args: argparse.Namespace) -> int:
                 "user_id": str(user_id),
                 "answer": answer.text,
             },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _profile_extract(args: argparse.Namespace) -> int:
+    manifest = ProjectManifestStore(args.root.resolve()).load()
+    result = build_research_graph_service(
+        database_url=_database_url(args.database_url)
+    ).extract_profile(
+        manifest.project_id,
+        args.paper_id,
+        args.version_id,
+    )
+    payload = {
+        "profile_id": str(result.profile.profile_id),
+        "project_id": str(result.profile.project_id),
+        "paper_id": str(result.profile.paper_id),
+        "version_id": str(result.profile.version_id),
+        "extractor_version": result.profile.provenance.extractor_version,
+        "schema_version": result.profile.provenance.schema_version,
+        "fields": [
+            {
+                "field_id": str(value.field_id),
+                "field_name": value.field_name.value,
+                "value": value.value,
+                "confidence": value.confidence,
+                "evidence_ids": [
+                    str(link.evidence_id) for link in value.evidence_links
+                ],
+            }
+            for value in result.profile.values
+        ],
+        "claims": len(result.claims),
+        "entities": len(result.entities),
+        "relations": len(result.relations),
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _compare(args: argparse.Namespace) -> int:
+    if len(args.paper_ids) < 2:
+        raise ValueError("compare requires at least two paper_ids")
+    manifest = ProjectManifestStore(args.root.resolve()).load()
+    result = build_comparison_service(
+        database_url=_database_url(args.database_url)
+    ).compare(manifest.project_id, tuple(args.paper_ids))
+    print(
+        json.dumps(
+            ComparePapersToolAdapter._serialize(result),
             ensure_ascii=False,
             indent=2,
         )

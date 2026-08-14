@@ -26,6 +26,13 @@ def test_phase1_tables_are_registered() -> None:
         "interactions",
         "notes",
         "user_preferences",
+        "paper_profiles",
+        "paper_profile_fields",
+        "claims",
+        "research_entities",
+        "research_entity_aliases",
+        "paper_relations",
+        "evidence_links",
     }
 
 
@@ -98,6 +105,31 @@ def test_notes_section_foreign_key_preserves_note_on_structure_rebuild() -> None
         if foreign_key.parent.name == "section_id"
     )
     assert section_foreign_key.ondelete == "SET NULL"
+
+
+def test_research_graph_schema_keeps_queryable_fields_and_evidence_provenance() -> None:
+    assert {
+        "field_name",
+        "ordinal",
+        "value",
+        "normalized_value",
+        "confidence",
+    } <= set(Base.metadata.tables["paper_profile_fields"].columns.keys())
+    assert {
+        "paper_id",
+        "version_id",
+        "section_id",
+        "chunk_id",
+        "element_id",
+        "page_start",
+        "page_end",
+        "source_block_ids_json",
+        "evidence_text",
+        "evidence_kind",
+    } <= set(Base.metadata.tables["evidence_links"].columns.keys())
+    assert "uq_paper_relations_active_key" in {
+        index.name for index in Base.metadata.tables["paper_relations"].indexes
+    }
 
 
 def test_postgresql_schema_emits_circular_canonical_version_fk() -> None:

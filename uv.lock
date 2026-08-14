@@ -1056,7 +1056,7 @@ wheels = [
 
 [[package]]
 name = "paper-agent"
-version = "0.5.1"
+version = "0.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },

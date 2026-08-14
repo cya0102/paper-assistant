@@ -19,6 +19,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text as sql_text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PostgresUUID
 from sqlalchemy.dialects.postgresql import TSVECTOR
@@ -534,6 +535,298 @@ class ChunkEmbeddingRow(TimestampMixin, Base):
     )
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     embedding: Mapped[tuple[float, ...]] = mapped_column(VectorType(EMBEDDING_DIMENSION), nullable=False)
+
+
+class PaperProfileRow(TimestampMixin, Base):
+    __tablename__ = "paper_profiles"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["version_id", "paper_id"],
+            ["paper_versions.version_id", "paper_versions.paper_id"],
+            name="fk_paper_profiles_version_paper",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "source_document_hash IS NULL OR source_document_hash ~ '^[0-9a-f]{64}$'",
+            name="source_document_hash_sha256",
+        ),
+        Index(
+            "uq_paper_profiles_active_version",
+            "project_id",
+            "paper_id",
+            "version_id",
+            unique=True,
+            postgresql_where=sql_text("is_active"),
+        ),
+        Index("ix_paper_profiles_project_paper", "project_id", "paper_id"),
+    )
+
+    profile_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), primary_key=True)
+    project_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        ForeignKey("projects.project_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    paper_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    version_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    extraction_method: Mapped[str] = mapped_column(String(128), nullable=False)
+    extractor_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    model_name: Mapped[str | None] = mapped_column(String(255))
+    prompt_version: Mapped[str | None] = mapped_column(String(255))
+    source_document_hash: Mapped[str | None] = mapped_column(String(64))
+    chunking_version: Mapped[str | None] = mapped_column(String(255))
+    generation_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    additional_attributes_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    superseded_by_profile_id: Mapped[UUID | None] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        ForeignKey("paper_profiles.profile_id", ondelete="SET NULL"),
+    )
+
+
+class PaperProfileFieldRow(TimestampMixin, Base):
+    __tablename__ = "paper_profile_fields"
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_id",
+            "field_name",
+            "ordinal",
+            name="uq_profile_fields_profile_name_ordinal",
+        ),
+        CheckConstraint("ordinal >= 0", name="ordinal_nonnegative"),
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="confidence_range"),
+        Index("ix_profile_fields_name", "field_name"),
+    )
+
+    field_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), primary_key=True)
+    profile_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        ForeignKey("paper_profiles.profile_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    field_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_value: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[float] = mapped_column(nullable=False)
+    review_status: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class ClaimRow(TimestampMixin, Base):
+    __tablename__ = "claims"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["version_id", "paper_id"],
+            ["paper_versions.version_id", "paper_versions.paper_id"],
+            name="fk_claims_version_paper",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="confidence_range"),
+        CheckConstraint(
+            "source_document_hash IS NULL OR source_document_hash ~ '^[0-9a-f]{64}$'",
+            name="source_document_hash_sha256",
+        ),
+        Index(
+            "uq_claims_active_key",
+            "project_id",
+            "claim_key",
+            unique=True,
+            postgresql_where=sql_text("is_active"),
+        ),
+        Index("ix_claims_project_paper_type", "project_id", "paper_id", "claim_type"),
+    )
+
+    claim_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), primary_key=True)
+    project_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        ForeignKey("projects.project_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    paper_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    version_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    claim_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    statement: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_statement: Mapped[str] = mapped_column(Text, nullable=False)
+    polarity: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(nullable=False)
+    extraction_method: Mapped[str] = mapped_column(String(128), nullable=False)
+    extractor_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    model_name: Mapped[str | None] = mapped_column(String(255))
+    prompt_version: Mapped[str | None] = mapped_column(String(255))
+    source_document_hash: Mapped[str | None] = mapped_column(String(64))
+    chunking_version: Mapped[str | None] = mapped_column(String(255))
+    generation_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    claim_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    review_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    entailment_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    superseded_by_claim_id: Mapped[UUID | None] = mapped_column(
+        PostgresUUID(as_uuid=True), ForeignKey("claims.claim_id", ondelete="SET NULL")
+    )
+
+
+class ResearchEntityRow(TimestampMixin, Base):
+    __tablename__ = "research_entities"
+    __table_args__ = (
+        CheckConstraint(
+            "source_document_hash IS NULL OR source_document_hash ~ '^[0-9a-f]{64}$'",
+            name="source_document_hash_sha256",
+        ),
+        UniqueConstraint(
+            "project_id",
+            "entity_type",
+            "normalized_name",
+            name="uq_research_entities_project_type_name",
+        ),
+        Index("ix_research_entities_project_type", "project_id", "entity_type"),
+    )
+
+    entity_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), primary_key=True)
+    project_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        ForeignKey("projects.project_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    canonical_name: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    normalization_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    extraction_method: Mapped[str] = mapped_column(String(128), nullable=False)
+    extractor_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    model_name: Mapped[str | None] = mapped_column(String(255))
+    prompt_version: Mapped[str | None] = mapped_column(String(255))
+    source_document_hash: Mapped[str | None] = mapped_column(String(64))
+    chunking_version: Mapped[str | None] = mapped_column(String(255))
+    generation_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    attributes_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class ResearchEntityAliasRow(Base):
+    __tablename__ = "research_entity_aliases"
+    __table_args__ = (
+        UniqueConstraint(
+            "entity_id", "normalized_alias", name="uq_research_entity_aliases_entity_alias"
+        ),
+        Index("ix_research_entity_aliases_normalized", "normalized_alias"),
+    )
+
+    alias_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    entity_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        ForeignKey("research_entities.entity_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    alias: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_alias: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class PaperRelationRow(TimestampMixin, Base):
+    __tablename__ = "paper_relations"
+    __table_args__ = (
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="confidence_range"),
+        CheckConstraint(
+            "source_document_hash IS NULL OR source_document_hash ~ '^[0-9a-f]{64}$'",
+            name="source_document_hash_sha256",
+        ),
+        Index(
+            "uq_paper_relations_active_key",
+            "project_id",
+            "relation_key",
+            unique=True,
+            postgresql_where=sql_text("is_active"),
+        ),
+        Index("ix_paper_relations_project_type", "project_id", "relation_type"),
+        Index("ix_paper_relations_source", "project_id", "source_type", "source_id"),
+        Index("ix_paper_relations_target", "project_id", "target_type", "target_id"),
+    )
+
+    relation_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), primary_key=True)
+    project_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        ForeignKey("projects.project_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    relation_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    relation_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[float] = mapped_column(nullable=False)
+    extraction_method: Mapped[str] = mapped_column(String(128), nullable=False)
+    extractor_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    model_name: Mapped[str | None] = mapped_column(String(255))
+    prompt_version: Mapped[str | None] = mapped_column(String(255))
+    source_document_hash: Mapped[str | None] = mapped_column(String(64))
+    chunking_version: Mapped[str | None] = mapped_column(String(255))
+    generation_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    review_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    superseded_by_relation_id: Mapped[UUID | None] = mapped_column(
+        PostgresUUID(as_uuid=True), ForeignKey("paper_relations.relation_id", ondelete="SET NULL")
+    )
+
+
+class EvidenceLinkRow(Base):
+    __tablename__ = "evidence_links"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["version_id", "paper_id"],
+            ["paper_versions.version_id", "paper_versions.paper_id"],
+            name="fk_evidence_links_version_paper",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "project_id",
+            "target_type",
+            "target_id",
+            "evidence_key",
+            name="uq_evidence_links_target_evidence",
+        ),
+        CheckConstraint("page_start >= 1 AND page_end >= page_start", name="page_range"),
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="confidence_range"),
+        Index("ix_evidence_links_target", "project_id", "target_type", "target_id"),
+        Index("ix_evidence_links_paper_version", "project_id", "paper_id", "version_id"),
+        Index("ix_evidence_links_chunk", "chunk_id"),
+    )
+
+    evidence_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), primary_key=True)
+    project_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        ForeignKey("projects.project_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    target_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    paper_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    version_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    section_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    chunk_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    element_id: Mapped[UUID | None] = mapped_column(PostgresUUID(as_uuid=True))
+    page_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    page_end: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_block_ids_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    evidence_text: Mapped[str] = mapped_column(Text, nullable=False)
+    relation_to_target: Mapped[str] = mapped_column(String(32), nullable=False)
+    evidence_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(nullable=False)
+    evidence_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class InteractionRow(Base):

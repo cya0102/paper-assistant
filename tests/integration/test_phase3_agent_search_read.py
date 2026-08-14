@@ -37,7 +37,11 @@ class ToolCallingModel:
         self.version_id = version_id
 
     def start(self, checkpoint, tools):
-        assert {item["name"] for item in tools} == {"search_knowledge", "read_paper"}
+        assert {item["name"] for item in tools} == {
+            "search_knowledge",
+            "read_paper",
+            "compare_papers",
+        }
         return ModelTurn(
             "response-search-read",
             tool_calls=(
