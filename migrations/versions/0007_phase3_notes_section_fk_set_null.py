@@ -13,14 +13,15 @@ down_revision: str | None = "0006_phase3"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
+SECTION_FK = "fk_notes_section_id_sections"
 
 def upgrade() -> None:
     # Migration 0005 created this FK without a name, so PostgreSQL assigned the
     # default name ``notes_section_id_fkey`` (NOT the model-convention name
     # ``fk_notes_section_id_sections``). Drop the real name before recreating.
-    op.drop_constraint("notes_section_id_fkey", "notes", type_="foreignkey")
+    op.drop_constraint(SECTION_FK, "notes", type_="foreignkey")
     op.create_foreign_key(
-        "fk_notes_section_id_sections",
+        SECTION_FK,
         "notes",
         "sections",
         ["section_id"],
@@ -34,7 +35,7 @@ def downgrade() -> None:
     # Restore the original unnamed-FK state created by migration 0005, so a
     # downgrade/upgrade cycle keeps working.
     op.create_foreign_key(
-        "notes_section_id_fkey",
+        SECTION_FK,
         "notes",
         "sections",
         ["section_id"],

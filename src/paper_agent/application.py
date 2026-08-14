@@ -99,7 +99,7 @@ def build_agent_runtime(
 ) -> AgentRuntime:
     tools = ToolRegistry()
     tools.register(SearchKnowledgeToolAdapter(build_search_knowledge_service(database_url=database_url), project_id).contract())
-    tools.register(ReadPaperToolAdapter(build_read_paper_service(database_url=database_url)).contract())
+    tools.register(ReadPaperToolAdapter(build_read_paper_service(database_url=database_url), project_id).contract())
     redis_client: Redis = Redis.from_url(redis_url, decode_responses=True)
     engine = create_engine(database_url, pool_pre_ping=True)
     memory_factory = sessionmaker(engine, class_=Session, expire_on_commit=False)

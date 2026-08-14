@@ -33,7 +33,7 @@ Phase 3 将 Phase 2A 的索引与检索后端扩展为可恢复的论文 Agent R
 
 - 新增 Context Builder，使用 Token Budget 控制送入模型的证据总量。
 - 对多论文证据执行每篇上限和轮询选择，避免单篇论文占满 Context。
-- 给 Evidence 分配 `[E1]` 引用标签。
+- 给 Evidence 分配稳定的 `[E{数字}]` 引用标签（由证据 ID 派生，示例 `[E62497060534405]`）。
 - 最终答案会校验引用是否真实存在；未知引用或有证据却完全不引用时拒绝完成。
 - 输出末尾附 Paper Title、Section Path 和 Page Range 来源。
 

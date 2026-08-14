@@ -70,6 +70,7 @@ def _build_parser() -> argparse.ArgumentParser:
     search.add_argument("--max-evidence", type=int, default=5)
     read = subparsers.add_parser("read", help="Read a paper Section, pages, or Element")
     _database_argument(read)
+    _root_argument(read)
     read.add_argument("paper_id", type=UUID)
     read.add_argument("--section-id", type=UUID)
     read.add_argument("--pages", nargs=2, type=int)
@@ -185,12 +186,14 @@ def _search(args: argparse.Namespace) -> int:
 
 
 def _read(args: argparse.Namespace) -> int:
+    manifest = ProjectManifestStore(args.root.resolve()).load()
     pages = (args.pages[0], args.pages[1]) if args.pages else None
     result = build_read_paper_service(
         database_url=_database_url(args.database_url)
     ).read_paper(
         ReadPaperRequest(
             paper_id=args.paper_id,
+            project_id=manifest.project_id,
             section_id=args.section_id,
             page_range=pages,
             element_id=args.element_id,
@@ -203,6 +206,7 @@ def _read(args: argparse.Namespace) -> int:
         "title": result.title,
         "passages": [
             {
+                "citation": f"P{int(item.chunk_id.hex[:12], 16)}",
                 "chunk_id": str(item.chunk_id),
                 "section_path": item.section_path,
                 "pages": [item.page_start, item.page_end],
@@ -214,8 +218,10 @@ def _read(args: argparse.Namespace) -> int:
         ],
         "elements": [
             {
+                "citation": f"P{int(item.element_id.hex[:12], 16)}",
                 "element_id": str(item.element_id),
                 "type": item.element_type.value,
+                "section_path": item.section_path,
                 "label": item.label,
                 "caption": item.caption,
                 "content": item.content,

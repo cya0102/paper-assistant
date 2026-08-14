@@ -84,9 +84,15 @@ class CitationFormatter:
 
 
 class ToolEvidenceCitationFormatter:
-    """Validate model citations against actual Tool payloads and append provenance."""
+    """Validate model citations against actual Tool payloads and append provenance.
 
-    _citation = re.compile(r"\[(E\d+)]")
+    Two citation namespaces are supported:
+    - [E<number>] for search_knowledge Evidence entries;
+    - [P<number>] for read_paper passages.
+    Both are validated against the actual Tool payloads before the answer is kept.
+    """
+
+    _citation = re.compile(r"\[([EP]\d+)]")
 
     def __call__(self, answer: str, tool_results: tuple[ToolResult, ...]) -> str:
         allowed: dict[str, dict[str, object]] = {}
@@ -94,14 +100,28 @@ class ToolEvidenceCitationFormatter:
             for raw in result.payload.get("evidence", []):
                 if isinstance(raw, dict) and isinstance(raw.get("citation"), str):
                     allowed[raw["citation"]] = raw
+            for raw in result.payload.get("passages", []):
+                if not isinstance(raw, dict) or not isinstance(raw.get("citation"), str):
+                    continue
+                passage = dict(raw)
+                passage.setdefault("paper_title", result.payload.get("title"))
+                allowed[raw["citation"]] = passage
         used = tuple(dict.fromkeys(self._citation.findall(answer)))
         unknown = tuple(label for label in used if label not in allowed)
         if unknown:
             raise ValueError(f"Answer contains unknown citations: {', '.join(unknown)}")
         if allowed and not used:
-            raise ValueError("Evidence-backed answer must cite the tool Evidence")
+            raise ValueError("Answer with tool sources must contain at least one citation")
         if not used:
             return answer.rstrip()
+        # Every provided source namespace must be cited at least once so a
+        # mixed Search+Read answer cannot silently ignore the Read sources.
+        missing = {label[0] for label in allowed} - {label[0] for label in used}
+        if missing:
+            raise ValueError(
+                "Answer must cite every provided source namespace; missing: "
+                + ", ".join(sorted(missing))
+            )
         sources = ["", "来源："]
         for label in used:
             item = allowed[label]

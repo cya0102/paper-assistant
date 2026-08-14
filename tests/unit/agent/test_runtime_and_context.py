@@ -174,3 +174,134 @@ def test_tool_citation_formatter_rejects_hallucinated_reference():
     formatter = ToolEvidenceCitationFormatter()
     with pytest.raises(ValueError, match="unknown citations"):
         formatter("unsupported [E9]", ())
+
+
+def test_tool_citation_formatter_accepts_read_passage_citation():
+    formatter = ToolEvidenceCitationFormatter()
+    result = ToolResult(
+        call_id="read-1",
+        name="read_paper",
+        payload={
+            "title": "Scene Codebook Paper",
+            "passages": [
+                {
+                    "citation": "P123",
+                    "section_path": "3 Method > 3.2 Codebook",
+                    "page_start": 5,
+                    "page_end": 6,
+                    "text": "The codebook clusters scene features.",
+                }
+            ],
+        },
+    )
+    formatted = formatter("Codebook 通过聚类场景特征构建。[P123]", (result,))
+    assert "来源：" in formatted
+    assert "[P123] Scene Codebook Paper，3 Method > 3.2 Codebook，pp.5-6" in formatted
+
+
+def test_tool_citation_formatter_rejects_unknown_read_citation():
+    formatter = ToolEvidenceCitationFormatter()
+    result = ToolResult(
+        call_id="read-1",
+        name="read_paper",
+        payload={
+            "title": "Paper",
+            "passages": [
+                {"citation": "P123", "section_path": "Method", "page_start": 1, "page_end": 2, "text": "text"}
+            ],
+        },
+    )
+    with pytest.raises(ValueError, match="unknown citations"):
+        formatter("unsupported [P999]", (result,))
+
+
+def test_tool_citation_formatter_requires_citation_when_read_sources_exist():
+    formatter = ToolEvidenceCitationFormatter()
+    result = ToolResult(
+        call_id="read-1",
+        name="read_paper",
+        payload={"title": "Paper", "passages": [{"citation": "P1", "section_path": "Method", "page_start": 1, "page_end": 2, "text": "text"}]},
+    )
+    with pytest.raises(ValueError, match="at least one citation"):
+        formatter("No citation here.", (result,))
+
+
+def test_tool_citation_formatter_requires_each_namespace_cited():
+    formatter = ToolEvidenceCitationFormatter()
+    search_result = ToolResult(
+        call_id="search-1",
+        name="search_knowledge",
+        payload={
+            "evidence": [
+                {"citation": "E123", "paper_title": "Paper", "section_path": "Method", "page_start": 1, "page_end": 2, "text": "search text"}
+            ]
+        },
+    )
+    read_result = ToolResult(
+        call_id="read-1",
+        name="read_paper",
+        payload={
+            "title": "Paper",
+            "evidence": [
+                {"citation": "P456", "paper_title": "Paper", "section_path": "Results", "page_start": 3, "page_end": 4, "text": "read text"}
+            ],
+        },
+    )
+    with pytest.raises(ValueError, match="missing"):
+        formatter("Only search evidence cited.[E123]", (search_result, read_result))
+    formatted = formatter("Both sources cited.[E123][P456]", (search_result, read_result))
+    assert "来源：" in formatted and "[P456]" in formatted
+
+
+def test_read_only_answer_persists_memory_and_session():
+    paper_id, chunk_id = uuid4(), uuid4()
+    registry = ToolRegistry()
+    registry.register(
+        ToolContract(
+            name="read_paper",
+            description="read",
+            parameters={"type": "object"},
+            handler=lambda arguments: {
+                "evidence": [
+                    {
+                        "citation": "P1",
+                        "paper_id": str(paper_id),
+                        "chunk_id": str(chunk_id),
+                        "paper_title": "Paper",
+                        "section_path": "3 Method",
+                        "page_start": 5,
+                        "page_end": 6,
+                        "text": "read evidence",
+                    }
+                ]
+            },
+        )
+    )
+
+    class ReadOnlyModel:
+        def start(self, checkpoint, tools):
+            assert tools[0]["name"] == "read_paper"
+            return ModelTurn("response-1", tool_calls=(ToolCall("call-1", "read_paper", {"paper_id": str(paper_id)}),))
+
+        def continue_with_tools(self, checkpoint, results, tools):
+            return ModelTurn("response-2", output_text="结论来自阅读。[P1]")
+
+    store = InMemoryCheckpointStore()
+    sessions = InMemorySessionStore()
+    memory = Memory()
+    answer = AgentRuntime(
+        ReadOnlyModel(),
+        registry,
+        store,
+        answer_finalizer=ToolEvidenceCitationFormatter(),
+        sessions=sessions,
+        memory=memory,
+    ).run(session_id=(session_id := uuid4()), user_id=uuid4(), project_id=uuid4(), query="read it")
+
+    assert memory.interactions[0].paper_ids == (paper_id,)
+    assert memory.interactions[0].retrieved_chunk_ids == (chunk_id,)
+    state = sessions.load(session_id)
+    assert state is not None
+    assert state.current_paper_id == paper_id
+    assert chunk_id in state.active_chunk_ids
+    assert answer.text

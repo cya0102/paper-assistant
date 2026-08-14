@@ -12,6 +12,7 @@ from paper_agent.agent.tools import ToolRegistry
 from paper_agent.database import upgrade_database
 from paper_agent.domain.agent import ModelTurn, ToolCall
 from paper_agent.domain.enums import FileStatus, PipelineStage, SourceType
+from paper_agent.domain.reading import ReadPaperRequest
 from paper_agent.domain.memory import Interaction, Note, UserPreference
 from paper_agent.indexing import HashingEmbeddingProvider, HierarchicalIndexingService
 from paper_agent.memory import InMemoryCheckpointStore
@@ -48,8 +49,10 @@ class ToolCallingModel:
     def continue_with_tools(self, checkpoint, results, tools):
         assert {item.name for item in results} == {"search_knowledge", "read_paper"}
         search = next(item for item in results if item.name == "search_knowledge")
+        read = next(item for item in results if item.name == "read_paper")
         citation = search.payload["evidence"][0]["citation"]
-        return ModelTurn("response-final", output_text=f"Codebook 由场景特征聚类得到。[{citation}]")
+        read_citation = read.payload["passages"][0]["citation"]
+        return ModelTurn("response-final", output_text=f"Codebook 由场景特征聚类得到。[{citation}] 阅读详情见 [{read_citation}]")
 
 
 def test_phase3_agent_search_read_and_memory_round_trip():
@@ -58,6 +61,7 @@ def test_phase3_agent_search_read_and_memory_round_trip():
     engine = create_engine(DATABASE_URL)
     factory = sessionmaker(engine, class_=Session, expire_on_commit=False)
     project_id, paper_id, version_id, section_id = uuid4(), uuid4(), uuid4(), uuid4()
+    other_project, other_version = uuid4(), uuid4()
     user_id, session_id, chunk_one, chunk_two = uuid4(), uuid4(), uuid4(), uuid4()
     try:
         assert {"interactions", "notes", "user_preferences"} <= set(inspect(engine).get_table_names())
@@ -83,11 +87,46 @@ def test_phase3_agent_search_read_and_memory_round_trip():
         )
         registry = ToolRegistry()
         registry.register(SearchKnowledgeToolAdapter(search, project_id).contract())
-        registry.register(ReadPaperToolAdapter(ReadPaperService(SqlAlchemyPaperReadRepository(factory))).contract())
+        registry.register(ReadPaperToolAdapter(ReadPaperService(SqlAlchemyPaperReadRepository(factory)), project_id).contract())
         answer = AgentRuntime(ToolCallingModel(paper_id, version_id), registry, InMemoryCheckpointStore(), answer_finalizer=ToolEvidenceCitationFormatter()).run(session_id=session_id, user_id=user_id, project_id=project_id, query="How is the codebook built?")
-        assert "[E" in answer.text and "来源：" in answer.text
+        assert "[E" in answer.text and "[P" in answer.text and "来源：" in answer.text
         assert len(answer.tool_results[0].payload["evidence"]) >= 1
         assert len(answer.tool_results[1].payload["passages"]) == 2
+        assert all(item["citation"].startswith("P") for item in answer.tool_results[1].payload["passages"])
+        assert len(answer.tool_results[1].payload["evidence"]) == 2
+        with pytest.raises(LookupError, match="not found in project"):
+            ReadPaperService(SqlAlchemyPaperReadRepository(factory)).read_paper(
+                ReadPaperRequest(paper_id=paper_id, project_id=uuid4())
+            )
+        with pytest.raises(TypeError):
+            ReadPaperRequest(paper_id=paper_id)
+
+        # Version-level isolation: the same Paper can exist in two projects with
+        # different Versions; a project must not read a Version it does not own,
+        # and default reads must resolve to the project-owned Version.
+        with factory.begin() as session:
+            session.add(ProjectRow(project_id=other_project, name="phase3-other", root_path=f"/tmp/{other_project}"))
+            session.add(PaperVersionRow(version_id=other_version, paper_id=paper_id, source_type=SourceType.LOCAL.value, pipeline_status=PipelineStage.CHUNKED.value))
+            # These rows are the parents of PaperFileRow. Flush them first because
+            # the ORM mappings intentionally do not define relationships that would
+            # otherwise establish a deterministic unit-of-work insert order.
+            session.flush()
+            session.add(PaperFileRow(file_id=uuid4(), project_id=other_project, paper_id=paper_id, version_id=other_version, file_size=10, file_hash=(other_project.hex + other_version.hex)[:64], page_count=6, metadata_json={}, is_canonical=True, status=FileStatus.CHUNKED.value))
+        read_service = ReadPaperService(SqlAlchemyPaperReadRepository(factory))
+        with pytest.raises(LookupError, match="not found in project"):
+            read_service.read_paper(
+                ReadPaperRequest(paper_id=paper_id, project_id=project_id, version_id=other_version)
+            )
+        with pytest.raises(LookupError, match="not found in project"):
+            read_service.read_paper(
+                ReadPaperRequest(paper_id=paper_id, project_id=other_project, version_id=version_id)
+            )
+        assert read_service.read_paper(
+            ReadPaperRequest(paper_id=paper_id, project_id=project_id)
+        ).version_id == version_id
+        assert read_service.read_paper(
+            ReadPaperRequest(paper_id=paper_id, project_id=other_project)
+        ).version_id == other_version
 
         memory = SqlAlchemyMemoryRepository(factory)
         memory.save_interaction(Interaction(user_id=user_id, session_id=session_id, query="codebook", paper_ids=(paper_id,), retrieved_chunk_ids=(chunk_one,), answer_summary="scene features"))
@@ -115,7 +154,7 @@ def test_phase3_agent_search_read_and_memory_round_trip():
             from paper_agent.storage.postgres.models import InteractionRow, UserPreferenceRow
             session.execute(delete(InteractionRow).where(InteractionRow.user_id == user_id))
             session.execute(delete(UserPreferenceRow).where(UserPreferenceRow.user_id == user_id))
-            session.execute(delete(ProjectRow).where(ProjectRow.project_id == project_id))
+            session.execute(delete(ProjectRow).where(ProjectRow.project_id.in_((project_id, other_project))))
             paper = session.get(PaperRow, paper_id)
             if paper is not None:
                 session.delete(paper)

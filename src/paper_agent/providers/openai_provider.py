@@ -229,9 +229,10 @@ class MimoResponsesModel:
                 "has_sufficient_evidence"
             ) is True:
                 return True
-            if item.name == "read_paper" and (
-                item.payload.get("passages") or item.payload.get("elements")
-            ):
+            # Read results are only citable through their unified "evidence",
+            # so a passages/elements-only payload must NOT finalize without
+            # any citation (it would pass the citation check vacuously).
+            if item.name == "read_paper" and item.payload.get("evidence"):
                 return True
         return False
 
@@ -239,12 +240,13 @@ class MimoResponsesModel:
     def _evidence_citations(results: tuple[ToolResult, ...]) -> tuple[str, ...]:
         citations: list[str] = []
         for result in results:
-            for raw in result.payload.get("evidence", []):
-                if not isinstance(raw, dict):
-                    continue
-                citation = raw.get("citation")
-                if isinstance(citation, str) and citation:
-                    citations.append(citation)
+            for key in ("evidence", "passages", "elements"):
+                for raw in result.payload.get(key, []):
+                    if not isinstance(raw, dict):
+                        continue
+                    citation = raw.get("citation")
+                    if isinstance(citation, str) and citation:
+                        citations.append(citation)
         return tuple(dict.fromkeys(citations))
 
     @classmethod
@@ -270,42 +272,33 @@ class MimoResponsesModel:
         citations: list[str] = []
         seen: set[str] = set()
         used = 0
+        # Merge Search Evidence and Read Evidence (passages/elements) into one
+        # budgeted pack. The seen set deduplicates entries that appear both in
+        # the unified "evidence" list and in the legacy "passages"/"elements".
         for result in results:
-            for raw in result.payload.get("evidence", []):
-                if not isinstance(raw, dict):
-                    continue
-                citation = raw.get("citation")
-                if not isinstance(citation, str) or not citation or citation in seen:
-                    continue
-                header = (
-                    f"[{citation}] {raw.get('paper_title')} | "
-                    f"{raw.get('section_path')} | "
-                    f"pp.{raw.get('page_start')}-{raw.get('page_end')}\n"
-                )
-                remaining = character_budget - used - len(header)
-                if remaining <= 0:
-                    continue
-                body = str(raw.get("text") or "")[:remaining]
-                block = header + body
-                blocks.append(block)
-                citations.append(citation)
-                seen.add(citation)
-                used += len(block)
-        if not blocks:
-            for result in results:
-                for raw in result.payload.get("passages", []):
+            for key in ("evidence", "passages", "elements"):
+                for raw in result.payload.get(key, []):
                     if not isinstance(raw, dict):
                         continue
+                    citation = raw.get("citation")
+                    if not isinstance(citation, str) or not citation or citation in seen:
+                        continue
+                    paper_title = raw.get("paper_title") or result.payload.get("title")
                     header = (
-                        f"READ | {result.payload.get('title')} | "
+                        f"[{citation}] {paper_title} | "
                         f"{raw.get('section_path')} | "
                         f"pp.{raw.get('page_start')}-{raw.get('page_end')}\n"
                     )
                     remaining = character_budget - used - len(header)
                     if remaining <= 0:
                         continue
-                    block = header + str(raw.get("text") or "")[:remaining]
+                    body = str(
+                        raw.get("text") or raw.get("content") or raw.get("caption") or ""
+                    )[:remaining]
+                    block = header + body
                     blocks.append(block)
+                    citations.append(citation)
+                    seen.add(citation)
                     used += len(block)
         evidence_pack = "\n\n".join(blocks) or "（工具没有返回可用证据。）"
         model_input.append(
@@ -314,7 +307,7 @@ class MimoResponsesModel:
                 "content": (
                     "检索和阅读阶段已经结束，禁止继续调用或模拟任何工具。"
                     "请现在直接回答最初的问题，并且只能依据下面的证据包。"
-                    "引用时必须原样复制证据前的 [E编号]。\n\n"
+                    "引用时必须原样复制证据包中每条内容前的引用编号（检索证据为 [E编号]，阅读段落为 [P编号]）。\n\n"
                     f"证据包：\n{evidence_pack}"
                 ),
             }
@@ -327,7 +320,19 @@ class MimoResponsesModel:
         lowered = output_text.casefold()
         if not output_text.strip() or "<tool_call" in lowered or "<function=" in lowered:
             return False
-        return not citations or any(f"[{citation}]" in output_text for citation in citations)
+        # A finalization request always carries citable evidence; an answer
+        # without any citation is a contract error, not a legal answer.
+        if not citations:
+            return False
+        present = {citation[0] for citation in citations}
+        return all(
+            any(
+                f"[{citation}]" in output_text
+                for citation in citations
+                if citation[0] == prefix
+            )
+            for prefix in present
+        )
 
     @staticmethod
     def _response_history(response: Any) -> list[dict[str, Any]]:

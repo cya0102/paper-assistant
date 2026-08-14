@@ -99,8 +99,9 @@ class SearchKnowledgeToolAdapter:
 
 
 class ReadPaperToolAdapter:
-    def __init__(self, service: ReadPaperService) -> None:
+    def __init__(self, service: ReadPaperService, project_id: UUID) -> None:
         self._service = service
+        self._project_id = project_id
 
     def contract(self) -> ToolContract:
         return ToolContract(
@@ -129,6 +130,7 @@ class ReadPaperToolAdapter:
         result = self._service.read_paper(
             ReadPaperRequest(
                 paper_id=UUID(arguments["paper_id"]),
+                project_id=self._project_id,
                 version_id=self._optional_uuid(arguments.get("version_id")),
                 section_id=self._optional_uuid(arguments.get("section_id")),
                 page_range=(int(page_range[0]), int(page_range[1])) if page_range else None,
@@ -145,36 +147,65 @@ class ReadPaperToolAdapter:
 
     @staticmethod
     def _serialize(result: ReadPaperResult) -> dict[str, Any]:
+        passages: list[dict[str, Any]] = [
+            {
+                "citation": f"P{int(item.chunk_id.hex[:12], 16)}",
+                "chunk_id": str(item.chunk_id),
+                "paper_title": result.title,
+                "section_id": str(item.section_id),
+                "section_path": item.section_path,
+                "page_start": item.page_start,
+                "page_end": item.page_end,
+                "chunk_order": item.chunk_order,
+                "element_ids": [str(value) for value in item.element_ids],
+                "source_group_ids": [str(value) for value in item.source_group_ids],
+                "source_block_ids": list(item.source_block_ids),
+                "text": item.text,
+            }
+            for item in result.passages
+        ]
+        elements: list[dict[str, Any]] = [
+            {
+                "citation": f"P{int(item.element_id.hex[:12], 16)}",
+                "element_id": str(item.element_id),
+                "element_type": item.element_type.value,
+                "paper_title": result.title,
+                "section_id": str(item.section_id),
+                "section_path": item.section_path,
+                "page_start": item.page,
+                "page_end": item.page,
+                "label": item.label,
+                "caption": item.caption,
+                "content": item.content,
+                "source_block_ids": list(item.source_block_ids),
+            }
+            for item in result.elements
+        ]
+        # Unified evidence so the Finalizer, MiMo synthesis, Runtime Memory and
+        # any other consumer can treat Read results exactly like Search results.
+        evidence = [
+            {
+                "citation": entry["citation"],
+                "paper_id": str(result.paper_id),
+                "version_id": str(result.version_id),
+                "paper_title": entry["paper_title"],
+                "section_id": entry["section_id"],
+                "section_path": entry["section_path"],
+                "page_start": entry["page_start"],
+                "page_end": entry["page_end"],
+                "chunk_id": entry.get("chunk_id"),
+                "element_id": entry.get("element_id"),
+                "text": entry["text"]
+                if "text" in entry
+                else entry.get("content") or entry.get("caption") or entry.get("label") or "",
+            }
+            for entry in (*passages, *elements)
+        ]
         return {
             "paper_id": str(result.paper_id),
             "version_id": str(result.version_id),
             "title": result.title,
-            "passages": [
-                {
-                    "chunk_id": str(item.chunk_id),
-                    "section_id": str(item.section_id),
-                    "section_path": item.section_path,
-                    "page_start": item.page_start,
-                    "page_end": item.page_end,
-                    "chunk_order": item.chunk_order,
-                    "element_ids": [str(value) for value in item.element_ids],
-                    "source_group_ids": [str(value) for value in item.source_group_ids],
-                    "source_block_ids": list(item.source_block_ids),
-                    "text": item.text,
-                }
-                for item in result.passages
-            ],
-            "elements": [
-                {
-                    "element_id": str(item.element_id),
-                    "element_type": item.element_type.value,
-                    "section_id": str(item.section_id),
-                    "label": item.label,
-                    "caption": item.caption,
-                    "content": item.content,
-                    "page": item.page,
-                    "source_block_ids": list(item.source_block_ids),
-                }
-                for item in result.elements
-            ],
+            "passages": passages,
+            "elements": elements,
+            "evidence": evidence,
         }

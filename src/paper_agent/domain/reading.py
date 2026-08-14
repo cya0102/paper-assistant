@@ -9,6 +9,7 @@ from paper_agent.domain.enums import ElementType
 @dataclass(frozen=True, slots=True)
 class ReadPaperRequest:
     paper_id: UUID
+    project_id: UUID
     version_id: UUID | None = None
     section_id: UUID | None = None
     page_range: tuple[int, int] | None = None
@@ -43,6 +44,7 @@ class ReadElement:
     element_id: UUID
     element_type: ElementType
     section_id: UUID
+    section_path: str
     label: str | None
     caption: str | None
     content: str | None

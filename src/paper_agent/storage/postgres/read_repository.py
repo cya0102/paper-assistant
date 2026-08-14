@@ -12,7 +12,7 @@ from paper_agent.domain.reading import (
     ReadPaperResult,
     ReadPassage,
 )
-from paper_agent.storage.postgres.models import ChunkRow, ElementRow, PaperRow
+from paper_agent.storage.postgres.models import ChunkRow, ElementRow, PaperFileRow, PaperRow, SectionRow
 
 
 class SqlAlchemyPaperReadRepository:
@@ -21,12 +21,40 @@ class SqlAlchemyPaperReadRepository:
 
     def read(self, request: ReadPaperRequest) -> ReadPaperResult:
         with self._session_factory() as session:
+            # Project membership is checked first so errors do not reveal whether
+            # a paper_id exists globally (uniform "not found in project").
+            project_file = session.scalar(
+                select(PaperFileRow)
+                .where(
+                    PaperFileRow.project_id == request.project_id,
+                    PaperFileRow.paper_id == request.paper_id,
+                )
+                .order_by(PaperFileRow.is_canonical.desc(), PaperFileRow.updated_at.desc())
+                .limit(1)
+            )
+            if project_file is None:
+                raise LookupError("Paper not found in project")
+            # Resolve the version inside the project: prefer the project's
+            # canonical file; never fall back to the global canonical_version_id,
+            # which may belong to another project.
+            version_id = request.version_id
+            if version_id is None:
+                version_id = project_file.version_id
+            else:
+                version_owned = session.scalar(
+                    select(PaperFileRow.file_id).where(
+                        PaperFileRow.project_id == request.project_id,
+                        PaperFileRow.paper_id == request.paper_id,
+                        PaperFileRow.version_id == version_id,
+                    )
+                )
+                if version_owned is None:
+                    raise LookupError("Paper version not found in project")
+            if version_id is None:
+                raise LookupError("Project file has no version")
             paper = session.get(PaperRow, request.paper_id)
             if paper is None:
-                raise LookupError(f"Paper not found: {request.paper_id}")
-            version_id = request.version_id or paper.canonical_version_id
-            if version_id is None:
-                raise LookupError("Paper has no canonical version")
+                raise LookupError("Paper not found in project")
             chunks = list(
                 session.scalars(
                     select(ChunkRow)
@@ -41,6 +69,12 @@ class SqlAlchemyPaperReadRepository:
                     .order_by(ElementRow.page, ElementRow.element_id)
                 )
             )
+            section_paths = {
+                row.section_id: row.section_path
+                for row in session.scalars(
+                    select(SectionRow).where(SectionRow.version_id == version_id)
+                )
+            }
         matched_orders = {
             chunk.chunk_order
             for chunk in chunks
@@ -74,6 +108,7 @@ class SqlAlchemyPaperReadRepository:
                 element_id=element.element_id,
                 element_type=ElementType(element.element_type),
                 section_id=element.section_id,
+                section_path=section_paths.get(element.section_id, ""),
                 label=element.label,
                 caption=element.caption,
                 content=element.content,

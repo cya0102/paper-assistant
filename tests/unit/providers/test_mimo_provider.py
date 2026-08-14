@@ -223,3 +223,42 @@ def test_mimo_factory_rejects_markdown_base_url(monkeypatch):
 
     with pytest.raises(ValueError, match="plain http"):
         _language_model(provider="mimo", model="mimo-v2.5-pro")
+
+
+def test_mimo_merges_search_and_read_evidence_and_requires_both_namespaces():
+    responses = FakeResponses(
+        _function_response(),
+        _text_response("2D-TAN 使用二维时间图。[E1]"),
+        _text_response("2D-TAN 使用二维时间图联合建模相邻候选。[E1][P7]"),
+    )
+    model = MimoResponsesModel(
+        model="mimo-v2.5-pro",
+        client=SimpleNamespace(responses=responses),
+    )
+    checkpoint = _checkpoint()
+    first = model.start(checkpoint, _tools())
+    search_result = ToolResult(
+        first.tool_calls[0].call_id,
+        "search_knowledge",
+        {
+            "has_sufficient_evidence": True,
+            "evidence": [{"citation": "E1", "paper_title": "P", "section_path": "Method", "page_start": 1, "page_end": 2, "text": "search evidence"}],
+        },
+    )
+    read_result = ToolResult(
+        "read-call",
+        "read_paper",
+        {
+            "title": "P",
+            "evidence": [{"citation": "P7", "paper_title": "P", "section_path": "Results", "page_start": 3, "page_end": 4, "text": "read evidence"}],
+        },
+    )
+
+    final = model.continue_with_tools(checkpoint, (search_result, read_result), _tools())
+
+    assert final.output_text == "2D-TAN 使用二维时间图联合建模相邻候选。[E1][P7]"
+    assert len(responses.requests) == 3
+    pack = responses.requests[1]["input"][-1]["content"]
+    assert "[E1]" in pack and "[P7]" in pack
+    assert "search evidence" in pack and "read evidence" in pack
+    assert "上一次生成因缺少有效引用" in responses.requests[2]["instructions"]
