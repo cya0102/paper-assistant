@@ -1,0 +1,14 @@
+node_modules/
+dist/
+workspace/
+*.log
+.env
+.DS_Store
+coverage/
+.coverage
+.paper-agent/
+.mypy_cache/
+.pytest_cache/
+.venv/
+__pycache__/
+*.py[cod]

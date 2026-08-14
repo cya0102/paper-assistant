@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.25,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "paper-agent"
+version = "0.5.1"
+description = "Incremental, traceable ingestion foundation for a local paper agent."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.13,<2",
+    "openai>=1.100,<3",
+    "psycopg[binary]>=3.1,<4",
+    "pymupdf>=1.24,<2",
+    "pydantic>=2.5,<3",
+    "redis>=5,<7",
+    "sqlalchemy>=2.0,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.10,<2",
+    "pytest>=7.4,<9",
+    "pytest-cov>=4.1,<6",
+]
+neural = [
+    "sentence-transformers>=3,<6",
+]
+
+[project.scripts]
+paper-agent = "paper_agent.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/paper_agent"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
