@@ -46,6 +46,8 @@ def _tool_artifact_type(name: str) -> ArtifactType:
         return ArtifactType.WORKER_RESULT
     if name == "delegate_research":
         return ArtifactType.RESEARCH_TASK
+    if name == "retrieve_and_analyze_knowledge":
+        return ArtifactType.RESEARCH_TASK
     return ArtifactType.TOOL_RESULT
 
 
@@ -60,6 +62,8 @@ def _schema_version(name: str) -> str:
         return "worker-result-v1"
     if name == "delegate_research":
         return "research-task-v1"
+    if name == "retrieve_and_analyze_knowledge":
+        return "retrieve-offload-delegate-v1"
     return "tool-result-v1"
 
 
@@ -81,6 +85,10 @@ def extract_citation_manifest(
     elif name == "read_artifact":
         refs = _worker_citations({"citations": payload.get("citations", [])})
     elif name == "collect_research_task":
+        refs = _worker_citations(
+            {"citations": payload.get("citation_manifest", [])}
+        )
+    elif name == "retrieve_and_analyze_knowledge":
         refs = _worker_citations(
             {"citations": payload.get("citation_manifest", [])}
         )
@@ -232,6 +240,8 @@ def _views_for(name: str, payload: dict[str, Any]) -> tuple[str, ...]:
         return ("default", "evidence", "papers", "full")
     if name == "worker_result":
         return ("default", "result", "evidence", "report", "full")
+    if name == "retrieve_and_analyze_knowledge":
+        return ("default", "full")
     return ("default", "full")
 
 
@@ -256,6 +266,12 @@ def _summary_for(name: str, payload: dict[str, Any]) -> str:
         )
     if name == "worker_result":
         return str(payload.get("summary") or "worker result")
+    if name == "retrieve_and_analyze_knowledge":
+        return (
+            f"ROD status={payload.get('status')} "
+            f"rounds={payload.get('rounds_executed')} "
+            f"reports={len(payload.get('reports', []))}"
+        )
     return f"tool result for {name}"
 
 
@@ -514,6 +530,40 @@ def _compact_collection(
     }
 
 
+def _compact_rod(
+    payload: dict[str, Any], descriptor: ArtifactDescriptor | None, budget: int
+) -> dict[str, Any]:
+    claims = _bounded_dict_list(payload.get("claims"), budget=budget)
+    used = count_tokens(json.dumps(claims, ensure_ascii=False, sort_keys=True))
+    reports = _bounded_dict_list(payload.get("reports"), budget=budget, used=used)
+    used += count_tokens(json.dumps(claims, ensure_ascii=False, sort_keys=True))
+    evidence_artifacts = _bounded_dict_list(
+        payload.get("evidence_artifacts"), budget=budget, used=used
+    )
+    return {
+        "task_id": payload.get("task_id"),
+        "status": payload.get("status"),
+        "has_sufficient_evidence": payload.get("has_sufficient_evidence"),
+        "query": payload.get("query"),
+        "final_query": payload.get("final_query"),
+        "rounds_executed": payload.get("rounds_executed"),
+        "summary": payload.get("summary"),
+        "reason": payload.get("reason"),
+        "claims": claims,
+        "reports": reports,
+        "evidence_artifacts": evidence_artifacts,
+        "citation_manifest": list(payload.get("citation_manifest", [])),
+        "unresolved_questions": list(payload.get("unresolved_questions", []))[:20],
+        "failed_work_units": list(payload.get("failed_work_units", []))[:20],
+        "artifact_ref": _ref_dict(
+            descriptor,
+            available_views=_views_for(
+                "retrieve_and_analyze_knowledge", payload
+            ),
+        ),
+    }
+
+
 def _compact_view(
     name: str,
     payload: dict[str, Any],
@@ -534,6 +584,8 @@ def _compact_view(
         return _compact_delegate(payload, descriptor, budget)
     if name == "collect_research_task":
         return _compact_collection(payload, descriptor, budget)
+    if name == "retrieve_and_analyze_knowledge":
+        return _compact_rod(payload, descriptor, budget)
     return _compact_generic(payload, descriptor, budget)
 
 
@@ -560,6 +612,9 @@ def _enforce_model_budget(
         "reason",
         "suggestion",
         "summary",
+        "claims",
+        "reports",
+        "citation_manifest",
         "has_sufficient_evidence",
         "paper_id",
         "version_id",
@@ -579,6 +634,10 @@ def _enforce_model_budget(
         "failed_work_units",
         "work_unit_ids",
         "assigned_workers",
+        "query",
+        "final_query",
+        "rounds_executed",
+        "evidence_artifacts",
     )
     compact: dict[str, Any] = {}
     for key in priority:
@@ -732,6 +791,7 @@ class ToolResultMaterializer:
             "search_artifact",
             "delegate_research",
             "collect_research_task",
+            "retrieve_and_analyze_knowledge",
         }:
             model_payload = _compact_view(
                 call.name,

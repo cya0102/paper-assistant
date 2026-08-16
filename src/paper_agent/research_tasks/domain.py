@@ -27,6 +27,7 @@ class ResearchTaskType(StrEnum):
     MULTI_PAPER_COMPARISON = "multi_paper_comparison"
     LITERATURE_SURVEY = "literature_survey"
     CROSS_DOMAIN_EXPLORATION = "cross_domain_exploration"
+    RAG_EVIDENCE_ANALYSIS = "rag_evidence_analysis"
 
 
 class ResearchTaskStatus(StrEnum):
@@ -169,6 +170,7 @@ def task_generation_key(
     plan: tuple[str, ...],
     paper_ids: tuple[UUID, ...] = (),
     input_artifact_ids: tuple[UUID, ...] = (),
+    session_id: UUID | None = None,
 ) -> str:
     payload = json.dumps(
         [
@@ -179,6 +181,7 @@ def task_generation_key(
             list(plan),
             sorted(str(value) for value in paper_ids),
             sorted(str(value) for value in input_artifact_ids),
+            *([str(session_id)] if session_id is not None else []),
         ],
         ensure_ascii=False,
         sort_keys=True,

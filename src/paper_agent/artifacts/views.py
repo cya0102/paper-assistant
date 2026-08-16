@@ -385,6 +385,7 @@ _VIEWS: dict[
     ArtifactType.WORKER_RESULT: _worker_view,
     ArtifactType.TOOL_RESULT: _generic_view,
     ArtifactType.RESEARCH_TASK: _generic_view,
+    ArtifactType.RETRIEVED_EVIDENCE: _generic_view,
 }
 
 

@@ -196,6 +196,15 @@ def test_tool_citation_formatter_rejects_hallucinated_reference():
         formatter("unsupported [E9]", ())
 
 
+def test_tool_citation_formatter_rejects_unexecuted_tool_markup():
+    formatter = ToolEvidenceCitationFormatter()
+    with pytest.raises(ValueError, match="unexecuted tool-call markup"):
+        formatter(
+            "<tool_call><function=search_artifact></function></tool_call>",
+            (),
+        )
+
+
 def test_tool_citation_formatter_accepts_read_passage_citation():
     formatter = ToolEvidenceCitationFormatter()
     result = _read_result(

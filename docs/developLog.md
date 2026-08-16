@@ -259,7 +259,88 @@ $ py_compile 0007...py                              # 语法通过
 
 ---
 
-## 6. 验证结果汇总（全部修复后）
+## 6. 问题 4：MiMo Worker 的 Markdown JSON 围栏导致合法分析结果被拒绝
+
+### 6.1 业务场景与现象
+
+在 `retrieve-offload-delegate` 模式下询问 2D-TAN 的主要方法时，主流程已经成功完成检索、Evidence Artifact Offload 和 Worker 分发，但多个 Chunk Analyst 最终被标记为失败：
+
+```text
+Worker output is not valid JSON: Expecting value
+```
+
+数据库中的 `work_units` 显示这些 Worker 均已消耗两次尝试，任务只能以 `partially_completed` 或 `no_evidence` 结束。进一步读取 Redis Checkpoint 的 `model_history` 后发现，MiMo 实际返回了字段完整、引用正确且符合 Worker Schema 的 JSON，只是在外层增加了 Markdown 代码围栏：
+
+````text
+```json
+{
+  "relevance": "relevant",
+  "summary": "...",
+  "claims": [...],
+  "unresolved_questions": [...]
+}
+```
+````
+
+因此，这不是检索、Artifact、引用或 JSON 内容错误，而是 Provider 输出格式与 Worker 校验器之间的兼容问题。合法的 Evidence Claim 被误判为失败，最终表现为用户收到 `no_evidence`。
+
+### 6.2 根因
+
+`WorkerOutputValidator` 修复前直接把模型原始文本传给 `json.loads`：
+
+```python
+parsed = json.loads(answer_text)
+```
+
+当 `answer_text` 的第一个字符是 Markdown 围栏的反引号而不是 `{` 时，`json.loads` 会在第一个字符处抛出 `JSONDecodeError: Expecting value`。虽然围栏内部是合法 JSON，后续 JSON Schema、Claim 和 Citation Manifest 校验完全没有机会执行。
+
+### 6.3 修复方案
+
+在解析前增加一个边界严格的标准化步骤：只剥离**包裹整个 Worker 答案的单个 JSON Markdown 围栏**，然后继续使用原有 JSON 解析与校验流程。
+
+```python
+normalized = self._unwrap_json_fence(answer_text)
+parsed = json.loads(normalized)
+```
+
+`_unwrap_json_fence` 使用 `fullmatch`，仅接受以下两种完整答案：
+
+````text
+```json
+{...}
+```
+````
+
+或：
+
+````text
+```
+{...}
+```
+````
+
+修复刻意不采用“从任意自然语言中截取第一个 `{...}`”的宽松策略。类似 `下面是结果：{...}` 或在围栏前后添加解释文字的输出仍然会被拒绝，避免掩盖真正不符合 Worker Contract 的响应。Token Budget、JSON Schema、字段类型、Claim 和 Citation Manifest 校验均保持不变。
+
+### 6.4 测试与验证
+
+新增两项回归测试：
+
+1. 接受包裹整个答案的单个 `json` Markdown 围栏，并正确还原为标准 JSON；
+2. 拒绝围栏外仍包含自然语言前缀或后缀的响应，确保兼容处理没有放宽安全边界。
+
+验证结果：
+
+```text
+Delegation/Worker 专项测试：18 passed
+全部单元测试：151 passed
+git diff --check：通过
+```
+
+旧 Work Unit 的重试预算已经耗尽，因此修复后必须使用新的 `session_id` 重新执行 ROD 请求。新的 Worker 可以正常接收 MiMo 的围栏 JSON，继续完成 Schema、引用校验和 Worker Artifact 持久化。
+
+---
+
+## 7. 验证结果汇总（全部修复后）
 
 | 项目          | 结果                                                                                      |
 | ------------- | ----------------------------------------------------------------------------------------- |
@@ -270,7 +351,7 @@ $ py_compile 0007...py                              # 语法通过
 
 ---
 
-## 7. 经验总结（面试可讲的点）
+## 8. 经验总结（面试可讲的点）
 
 1. **"声明已实现"不等于"实现正确"**：版本失效机制在单一维度（版本号）下看似完整，但缺少"绑定到上游产物"的锚点，导致跨维度（parser 变化）失效失败。审查时要沿数据流逐环节核对，而不是只看接口名。
 2. **失效粒度：内容哈希 > 版本字符串**。`document_hash` 直接对解析产物建模，天然覆盖"任何导致输出变化的来源"，同时避免"版本变了但输出没变"的无谓重建。
@@ -284,7 +365,7 @@ $ py_compile 0007...py                              # 语法通过
 
 ---
 
-## 8. 面试可能追问与回答要点
+## 9. 面试可能追问与回答要点
 
 **Q1：为什么用 document_hash 而不是 parser_version 作为失效键？**
 答：parser_version 是"输入侧"信息，document_hash 是"输出侧"结果。换 parser 但输出相同（如只是元数据顺序变化）时，版本号变了但内容没变，按版本号会无谓重建；按内容哈希则精确反映"下游派生数据是否真的需要重算"。同时哈希由完整 document.json（含 parser 信息）计算，parser 真变时哈希必然变，不漏判。
@@ -309,7 +390,7 @@ $ py_compile 0007...py                              # 语法通过
 
 ---
 
-## 9. 本次改动的文件清单
+## 10. 本次改动的文件清单
 
 | 文件                                                           | 改动                                                       | 归属     |
 | -------------------------------------------------------------- | ---------------------------------------------------------- | -------- |

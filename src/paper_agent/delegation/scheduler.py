@@ -1,28 +1,47 @@
-"""Scheduler: synchronous, single-layer, dependency-aware WorkUnit execution.
+"""Scheduler: bounded-parallel, dependency-layer WorkUnit execution.
 
 v1 constraints: max one retry per WorkUnit, no worker can create workers,
-units run in topological order, and already-completed units (identified by
+units run in topological layers, and already-completed units (identified by
 their stable generation_key) are never re-executed.
 """
 
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
+from typing import Protocol
 from uuid import UUID
 
-from paper_agent.delegation.runner import WorkerRunner
 from paper_agent.research_tasks.domain import (
     ResearchTask,
     ResearchTaskStatus,
     WorkUnit,
     WorkUnitStatus,
+    WorkerResult,
 )
 from paper_agent.research_tasks.ports import ResearchTaskRepository
 
 
+class WorkUnitRunner(Protocol):
+    def run(self, work_unit: WorkUnit, *, user_id: UUID) -> WorkerResult: ...
+
+
+SchedulerEvent = Callable[[str, WorkUnit], None]
+
+
 class Scheduler:
-    def __init__(self, runner: WorkerRunner, *, max_attempts: int = 2) -> None:
+    def __init__(
+        self,
+        runner: WorkUnitRunner,
+        *,
+        max_attempts: int = 2,
+        max_workers: int = 3,
+    ) -> None:
+        if not 1 <= max_workers <= 5:
+            raise ValueError("max_workers must be between 1 and 5")
         self._runner = runner
         self._max_attempts = max_attempts
+        self._max_workers = max_workers
 
     def run(
         self,
@@ -31,6 +50,7 @@ class Scheduler:
         units: tuple[WorkUnit, ...],
         repository: ResearchTaskRepository,
         user_id: UUID,
+        on_event: SchedulerEvent | None = None,
     ) -> tuple[ResearchTask, tuple[WorkUnit, ...]]:
         """Execute all runnable units and return (updated_task, updated_units)."""
         running = task.status == ResearchTaskStatus.CREATED or task.status == ResearchTaskStatus.PLANNED
@@ -49,6 +69,7 @@ class Scheduler:
         ]
         while remaining:
             progressed = False
+            runnable_layer: list[tuple[WorkUnit, WorkUnit]] = []
             for unit in tuple(remaining):
                 missing = [dep for dep in unit.dependency_ids if dep not in by_id]
                 failed_dependencies = [
@@ -99,12 +120,38 @@ class Scheduler:
                         runnable.work_unit_id,
                         input_artifact_ids=runnable.input_artifact_ids,
                     )
-                finished = self._run_with_retry(runnable, repository, user_id)
-                updated[finished.work_unit_id] = finished
-                if finished.status == WorkUnitStatus.COMPLETED:
-                    completed[finished.work_unit_id] = finished
-                remaining.remove(unit)
+                runnable_layer.append((unit, runnable))
                 progressed = True
+            if runnable_layer:
+                worker_limit = min(
+                    self._max_workers,
+                    task.budget.max_workers,
+                    len(runnable_layer),
+                )
+
+                def execute(runnable: WorkUnit) -> WorkUnit:
+                    if on_event is not None:
+                        on_event("worker.started", runnable)
+                    finished = self._run_with_retry(
+                        runnable, repository, user_id
+                    )
+                    if on_event is not None:
+                        on_event("worker.completed", finished)
+                    return finished
+
+                with ThreadPoolExecutor(max_workers=worker_limit) as executor:
+                    futures = [
+                        (original, executor.submit(execute, runnable))
+                        for original, runnable in runnable_layer
+                    ]
+                    # Consume in deterministic input order while the executor
+                    # still runs all independent units concurrently.
+                    for original, future in futures:
+                        finished = future.result()
+                        updated[finished.work_unit_id] = finished
+                        if finished.status == WorkUnitStatus.COMPLETED:
+                            completed[finished.work_unit_id] = finished
+                        remaining.remove(original)
             if not progressed:
                 # The remaining graph contains a cycle. Fail it deterministically
                 # rather than depending on input ordering or looping forever.

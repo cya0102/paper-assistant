@@ -34,6 +34,8 @@ class AgentRuntime:
         materializer: ToolResultMaterializer | None = None,
         max_tool_calls: int | None = None,
         timeout_seconds: int | None = None,
+        required_tool_name: str | None = None,
+        answer_observer: Callable[[str, tuple[ToolResult, ...]], None] | None = None,
     ) -> None:
         self._model = model
         self._tools = tools
@@ -45,6 +47,8 @@ class AgentRuntime:
         self._materializer = materializer
         self._max_tool_calls = max_tool_calls
         self._timeout_seconds = timeout_seconds
+        self._required_tool_name = required_tool_name
+        self._answer_observer = answer_observer
 
     def run(
         self,
@@ -113,11 +117,23 @@ class AgentRuntime:
             checkpoint.step += 1
             if turn.output_text is not None:
                 try:
+                    if self._required_tool_name is not None and not any(
+                        item.name == self._required_tool_name and not item.is_error
+                        for item in checkpoint.tool_results
+                    ):
+                        raise ValueError(
+                            "Agent must execute required tool: "
+                            f"{self._required_tool_name}"
+                        )
                     answer_text = (
                         self._answer_finalizer(turn.output_text, tuple(checkpoint.tool_results))
                         if self._answer_finalizer is not None
                         else turn.output_text
                     )
+                    if self._answer_observer is not None:
+                        self._answer_observer(
+                            answer_text, tuple(checkpoint.tool_results)
+                        )
                 except Exception as error:
                     checkpoint.status = AgentRunStatus.FAILED
                     checkpoint.error = str(error)

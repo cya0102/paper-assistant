@@ -168,13 +168,15 @@ Profile/Claim evidence produces an explicit refusal cell rather than generated t
 
 ## Retrieve + Offload + Delegate
 
-Full tool results (comparison matrices, full-section reads, complete search
-candidates, worker outputs) are written to a content-addressed Artifact Store
-instead of the model context. The Agent receives a compact payload, an
-`artifact_ref`, and a citation manifest; it hydrates details on demand with
-`read_artifact`. Complex research questions can be delegated to isolated
-workers (`delegate_research` -> `collect_research_task`) that only ever see a
-task brief and return schema-valid artifacts.
+`paper-agent ask` now defaults to a deterministic Retrieve-Offload-Delegate
+path. `retrieve_and_analyze_knowledge` retrieves bounded Evidence, writes every
+selected Chunk to its own content-addressed Artifact, and runs one isolated
+`chunk_analyst` per Artifact with bounded parallelism. The main Agent receives
+only short reports, Claims, Artifact references, and a Citation Manifest; it
+never receives retrieved Chunk text. Evidence insufficiency permits one query
+rewrite, then returns `no_evidence`. Use `--trace summary|jsonl` for stage
+events and `--rag-mode direct` only for rollback/comparison. The explicit
+`delegate` command remains available for advanced research workflows.
 
 See [`docs/retrieve-offload-delegate.md`](docs/retrieve-offload-delegate.md) for the
 full design and CLI usage.

@@ -227,6 +227,34 @@ def test_worker_output_schema_enforced(tmp_path: Path) -> None:
     assert "missing required fields" in (result.error or "")
 
 
+def test_worker_output_validator_accepts_one_whole_json_fence() -> None:
+    validator = WorkerOutputValidator(
+        {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+            "required": ["summary"],
+            "additionalProperties": False,
+        }
+    )
+
+    normalized = validator(
+        '```json\n{"summary": "method evidence"}\n```',
+        (),
+    )
+
+    assert json.loads(normalized) == {"summary": "method evidence"}
+
+
+def test_worker_output_validator_rejects_prose_around_json_fence() -> None:
+    validator = WorkerOutputValidator(None)
+
+    with pytest.raises(ValueError, match="not valid JSON"):
+        validator(
+            'Here is the result:\n```json\n{"summary": "method evidence"}\n```',
+            (),
+        )
+
+
 def test_evidence_verifier_rejects_verified_verdict() -> None:
     registry = build_worker_registry()
     descriptor = registry.require("evidence_verifier")

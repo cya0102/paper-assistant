@@ -9,6 +9,7 @@ crosses back to the main Agent.
 
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -34,6 +35,10 @@ class WorkerOutputValidator:
     """Finalizer that requires a schema-valid JSON object as the Worker answer."""
 
     _citation_pattern = re.compile(r"^\[?([EP]\d+)\]?$")
+    _json_fence_pattern = re.compile(
+        r"```(?:json)?[ \t]*\r?\n(?P<body>.*?)\r?\n?```",
+        re.IGNORECASE | re.DOTALL,
+    )
 
     def __init__(
         self,
@@ -55,7 +60,7 @@ class WorkerOutputValidator:
                 f"Worker output exceeds token_budget={self._token_budget}"
             )
         try:
-            parsed = json.loads(answer_text)
+            parsed = json.loads(self._unwrap_json_fence(answer_text))
         except json.JSONDecodeError as error:
             raise ValueError(
                 f"Worker output is not valid JSON: {error.msg}"
@@ -64,9 +69,15 @@ class WorkerOutputValidator:
             raise ValueError("Worker output must be a JSON object")
         self._validate(parsed)
         self._validate_citations(parsed, tool_results)
-        if "citations" in parsed:
-            parsed["citations"] = list(self._citation_labels(parsed))
+        self._normalize_citations(parsed)
         return json.dumps(parsed, ensure_ascii=False)
+
+    @classmethod
+    def _unwrap_json_fence(cls, value: str) -> str:
+        """Remove one whole-answer JSON fence without accepting prose wrappers."""
+        normalized = value.strip()
+        match = cls._json_fence_pattern.fullmatch(normalized)
+        return match.group("body").strip() if match is not None else normalized
 
     def _validate(self, parsed: dict[str, Any]) -> None:
         if self._schema is None:
@@ -126,14 +137,51 @@ class WorkerOutputValidator:
     @classmethod
     def _citation_labels(cls, parsed: dict[str, Any]) -> tuple[str, ...]:
         labels: list[str] = []
-        for raw in parsed.get("citations", []):
-            if not isinstance(raw, str):
-                raise ValueError("Worker output citations must contain strings")
-            match = cls._citation_pattern.fullmatch(raw.strip())
-            if match is None:
-                raise ValueError(f"Invalid Worker citation label: {raw!r}")
-            labels.append(match.group(1))
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key == "citations":
+                        if not isinstance(child, list):
+                            raise ValueError(
+                                "Worker output citations must be an array"
+                            )
+                        for raw in child:
+                            if not isinstance(raw, str):
+                                raise ValueError(
+                                    "Worker output citations must contain strings"
+                                )
+                            match = cls._citation_pattern.fullmatch(raw.strip())
+                            if match is None:
+                                raise ValueError(
+                                    f"Invalid Worker citation label: {raw!r}"
+                                )
+                            labels.append(match.group(1))
+                    else:
+                        visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        visit(parsed)
         return tuple(dict.fromkeys(labels))
+
+    @classmethod
+    def _normalize_citations(cls, value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == "citations" and isinstance(child, list):
+                    normalized: list[str] = []
+                    for raw in child:
+                        match = cls._citation_pattern.fullmatch(str(raw).strip())
+                        if match is not None and match.group(1) not in normalized:
+                            normalized.append(match.group(1))
+                    value[key] = normalized
+                else:
+                    cls._normalize_citations(child)
+        elif isinstance(value, list):
+            for child in value:
+                cls._normalize_citations(child)
 
     @classmethod
     def _validate_citations(
@@ -170,6 +218,12 @@ class WorkerOutputValidator:
             )
         findings = parsed.get("findings")
         verdict = parsed.get("verdict")
+        claims = parsed.get("claims")
+        relevance = parsed.get("relevance")
+        if relevance == "relevant" and not claims:
+            raise ValueError(
+                "Relevant chunk analyst output requires at least one Claim"
+            )
         if verdict is not None and verdict not in {
             "supported",
             "contradicted",
@@ -178,6 +232,9 @@ class WorkerOutputValidator:
         }:
             raise ValueError(f"Invalid evidence-verification verdict: {verdict!r}")
         requires_evidence = bool(findings) and bool(available)
+        requires_evidence = requires_evidence or (
+            relevance in {"relevant", "partial"} and bool(claims)
+        )
         requires_evidence = requires_evidence or verdict in {
             "supported",
             "contradicted",
@@ -198,6 +255,7 @@ class WorkerRunner:
         search_service: Any = None,
         read_service: Any = None,
         context_builder: WorkerContextBuilder | None = None,
+        model_factory: Callable[[], LanguageModel] | None = None,
     ) -> None:
         self._registry = registry
         self._model = model
@@ -207,6 +265,7 @@ class WorkerRunner:
         self._search_service = search_service
         self._read_service = read_service
         self._context_builder = context_builder or WorkerContextBuilder()
+        self._model_factory = model_factory
 
     def run(self, work_unit: WorkUnit, *, user_id: UUID) -> WorkerResult:
         descriptor = self._registry.require(work_unit.requested_worker)
@@ -216,6 +275,19 @@ class WorkerRunner:
                 status="failed",
                 summary="",
                 error=f"worker {descriptor.name} is not implemented",
+            )
+        if descriptor.name == "chunk_analyst" and (
+            len(work_unit.input_artifact_ids) != 1
+            or work_unit.allowed_tools != ("read_artifact",)
+        ):
+            return WorkerResult(
+                work_unit_id=work_unit.work_unit_id,
+                status="failed",
+                summary="",
+                error=(
+                    "chunk_analyst requires exactly one input Artifact and only "
+                    "the read_artifact tool"
+                ),
             )
         disallowed_tools = sorted(
             set(work_unit.allowed_tools) - set(descriptor.allowed_tools)
@@ -243,19 +315,24 @@ class WorkerRunner:
             timeout_seconds=work_unit.timeout_seconds,
         )
         session_id = uuid5(NAMESPACE_URL, f"worker:{work_unit.work_unit_id}")
-        runtime = AgentRuntime(
-            self._model,
-            tools,
-            self._checkpoints,
-            answer_finalizer=WorkerOutputValidator(
-                work_unit.output_schema, token_budget=work_unit.token_budget
-            ),
-            materializer=self._materializer,
-            max_steps=work_unit.tool_call_budget + 2,
-            max_tool_calls=work_unit.tool_call_budget,
-            timeout_seconds=work_unit.timeout_seconds,
-        )
         try:
+            worker_model = (
+                self._model_factory()
+                if self._model_factory is not None
+                else self._model
+            )
+            runtime = AgentRuntime(
+                worker_model,
+                tools,
+                self._checkpoints,
+                answer_finalizer=WorkerOutputValidator(
+                    work_unit.output_schema, token_budget=work_unit.token_budget
+                ),
+                materializer=self._materializer,
+                max_steps=work_unit.tool_call_budget + 2,
+                max_tool_calls=work_unit.tool_call_budget,
+                timeout_seconds=work_unit.timeout_seconds,
+            )
             answer = runtime.run(
                 session_id=session_id,
                 user_id=user_id,
@@ -338,7 +415,12 @@ class WorkerRunner:
 
     @staticmethod
     def _summarize(parsed: dict[str, Any]) -> str:
-        findings = parsed.get("findings") or parsed.get("verdict") or ""
+        findings = (
+            parsed.get("summary")
+            or parsed.get("findings")
+            or parsed.get("verdict")
+            or ""
+        )
         if isinstance(findings, list):
             findings = "；".join(str(item) for item in findings[:3])
         return str(findings)[:500]

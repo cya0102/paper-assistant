@@ -9,6 +9,7 @@ refuses to run them rather than pretending they work.
 from typing import Any
 
 from paper_agent.delegation.registry import WorkerDescriptor, WorkerRegistry
+from paper_agent.workers.chunk_analyst import CHUNK_ANALYST_SCHEMA
 
 ANALYZER_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -44,6 +45,21 @@ VERIFIER_SCHEMA: dict[str, Any] = {
 
 def build_worker_registry() -> WorkerRegistry:
     registry = WorkerRegistry()
+    registry.register(
+        WorkerDescriptor(
+            name="chunk_analyst",
+            description=(
+                "只读取分配到的一个 retrieved_evidence Artifact，判断它与问题的"
+                "相关性，并输出该 Chunk 能直接支持的简短 Claim。"
+            ),
+            capabilities=("chunk_relevance", "claim_extraction"),
+            allowed_tools=("read_artifact",),
+            output_schema=CHUNK_ANALYST_SCHEMA,
+            default_token_budget=1200,
+            default_tool_call_budget=2,
+            timeout_seconds=90,
+        )
+    )
     registry.register(
         WorkerDescriptor(
             name="paper_analyzer",

@@ -45,6 +45,7 @@ class WorkerContextBuilder:
                 "最终回答必须是符合 output_schema 的单个 JSON 对象，禁止输出任何额外文本。",
                 "每个结论必须引用工具返回的引用编号（[E编号]/[P编号]）。",
                 "证据不足时在 findings 中明确说明，禁止编造。",
+                "如果角色是 chunk_analyst，只能读取唯一的 input_artifact_id；不得搜索、读取其他 Artifact 或使用对话记忆。",
             ],
         }
         return json.dumps(brief, ensure_ascii=False, indent=2)

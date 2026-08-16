@@ -52,6 +52,7 @@ class ArtifactType(StrEnum):
     PAPER_COMPARISON = "paper_comparison"
     WORKER_RESULT = "worker_result"
     RESEARCH_TASK = "research_task"
+    RETRIEVED_EVIDENCE = "retrieved_evidence"
 
 
 class ArtifactStatus(StrEnum):

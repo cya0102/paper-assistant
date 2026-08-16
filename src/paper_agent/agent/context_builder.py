@@ -93,8 +93,13 @@ class ToolEvidenceCitationFormatter:
     """
 
     _citation = re.compile(r"\[([EP]\d+)]")
+    _tool_markup = re.compile(
+        r"<\s*(?:tool_call|function\s*=|parameter\s*=)", re.IGNORECASE
+    )
 
     def __call__(self, answer: str, tool_results: tuple[ToolResult, ...]) -> str:
+        if self._tool_markup.search(answer):
+            raise ValueError("Final answer contains unexecuted tool-call markup")
         allowed: dict[str, dict[str, object]] = {}
         for result in tool_results:
             # The Citation Manifest is authoritative; the payload scan below is

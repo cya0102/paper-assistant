@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import sys
 from typing import NoReturn
 from uuid import UUID, uuid4
 
@@ -28,6 +29,7 @@ from paper_agent.domain.enums import ElementType
 from paper_agent.domain.reading import ReadPaperRequest
 from paper_agent.domain.retrieval import SearchRequest, SearchScope
 from paper_agent.project_manifest import ProjectManifestStore
+from paper_agent.rag import StreamRagTracer
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -100,6 +102,17 @@ def _build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--redis-url")
     ask.add_argument("--model")
     ask.add_argument("--provider", choices=("openai", "mimo"))
+    ask.add_argument(
+        "--rag-mode",
+        choices=("retrieve-offload-delegate", "direct"),
+        help="Standard ROD path (default) or legacy direct path for comparison",
+    )
+    ask.add_argument(
+        "--trace",
+        choices=("none", "summary", "jsonl"),
+        default="none",
+        help="Write RAG stage events to stderr",
+    )
     profile = subparsers.add_parser(
         "profile-extract", help="Extract an offline evidence-backed PaperProfile"
     )
@@ -116,7 +129,8 @@ def _build_parser() -> argparse.ArgumentParser:
     upgrade = subparsers.add_parser("db-upgrade", help="Apply all database migrations")
     _database_argument(upgrade)
     delegate = subparsers.add_parser(
-        "delegate", help="Run a bounded research delegation synchronously"
+        "delegate",
+        help="Advanced/debug: run a bounded research delegation synchronously",
     )
     _root_argument(delegate)
     _database_argument(delegate)
@@ -371,6 +385,13 @@ def _ask(args: argparse.Namespace) -> int:
         project_root=args.root.resolve(),
         user_id=user_id,
         session_id=session_id,
+        rag_mode=(
+            args.rag_mode
+            or os.environ.get(
+                "PAPER_AGENT_RAG_MODE", "retrieve-offload-delegate"
+            )
+        ),
+        rag_tracer=StreamRagTracer(mode=args.trace, stream=sys.stderr),
     ).run(
         session_id=session_id,
         user_id=user_id,

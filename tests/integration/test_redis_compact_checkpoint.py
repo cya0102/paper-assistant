@@ -92,6 +92,54 @@ def test_redis_checkpoint_round_trips_compact_tool_result():
         client.delete(checkpoints._key(session_id))
 
 
+def test_redis_rod_checkpoint_never_contains_retrieved_chunk_text():
+    assert REDIS_URL is not None
+    client = Redis.from_url(REDIS_URL, decode_responses=True)
+    session_id, user_id, project_id = uuid4(), uuid4(), uuid4()
+    checkpoints = RedisCheckpointStore(
+        client, ttl_seconds=60, prefix="paper-agent-test-rod"
+    )
+    secret = "FULL RETRIEVED CHUNK MUST STAY OFFLINE"
+    try:
+        checkpoint = AgentCheckpoint(
+            session_id=session_id,
+            user_id=user_id,
+            project_id=project_id,
+            messages=[ConversationMessage("user", "query")],
+            status=AgentRunStatus.RUNNING,
+            response_id="response-rod",
+            tool_results=[
+                ToolResult(
+                    call_id="rod-call",
+                    name="retrieve_and_analyze_knowledge",
+                    model_payload={
+                        "status": "supported",
+                        "summary": "compact analyst report",
+                        "claims": [
+                            {"text": "supported fact", "citations": ["E1"]}
+                        ],
+                        "evidence_artifacts": [
+                            {
+                                "artifact_id": str(uuid4()),
+                                "citation": "E1",
+                                "paper_title": "Paper",
+                            }
+                        ],
+                    },
+                    citation_manifest=(_citation("E1"),),
+                )
+            ],
+        )
+        checkpoints.save(checkpoint)
+        raw = client.get(checkpoints._key(session_id)) or ""
+
+        assert secret not in raw
+        assert "compact analyst report" in raw
+        assert "retrieve_and_analyze_knowledge" in raw
+    finally:
+        client.delete(checkpoints._key(session_id))
+
+
 def _now():
     from datetime import UTC, datetime
 

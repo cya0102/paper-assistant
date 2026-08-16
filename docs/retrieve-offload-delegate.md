@@ -1,5 +1,10 @@
 # Retrieve + Offload + Delegate
 
+> 当前状态（2026-08-16）：标准 `paper-agent ask` 已按
+> `retrieve-offload-delegate-rag-redesign.md` 升级为复合 ROD 路径。下文第 1～5 节
+> 仍说明可复用的 Artifact 层和高级 `delegate` 能力；普通问答的当前执行链、配置和
+> 验收以第 6 节为准。
+
 本阶段为 Paper Agent 引入三层分级执行策略，并把它实现为一条可运行的纵切：
 
 - **Retrieve**：定位候选论文、Chunk、Claim、Relation 或 Artifact。
@@ -56,6 +61,12 @@ src/paper_agent/
 
 ```text
 .paper-agent/artifacts/blobs/sha256/<ab>/<full-sha256>.json.gz
+```
+
+该路径相对于传给 CLI 的论文项目根目录，而不是代码仓库。按本文测试配置，实际位置为：
+
+```text
+/Users/chenyuan/Documents/develop/paperAgentTest/.paper-agent/artifacts/blobs/sha256/<ab>/<full-sha256>.json.gz
 ```
 
 - 路径完全由服务端生成，不接受用户输入拼接。
@@ -167,60 +178,185 @@ delegate_research
 
 ## 6. 验证指令与预期结果
 
-以下命令均在仓库根目录执行。
+本节对应重构后的标准问答路径：
 
-### 6.1 安装、静态检查与迁移链
+```text
+paper-agent ask
+→ retrieve_and_analyze_knowledge
+→ Retrieve
+→ 每个 Evidence Chunk 独立 Offload
+→ 同层有界并行 chunk_analyst
+→ Collect + Sufficiency
+→ 最多一次 Query Rewrite
+→ 最终合成或 no_evidence
+```
+
+普通问答验收不再要求用户手工执行 `delegate`，也不要求传入 `paper_id`、
+`workstream` 或 `max_workers`。`delegate` 只用于高级研究任务和故障调试。
+
+先区分代码仓库和论文项目目录：
+
+| 变量 | 路径 | 用途 |
+|---|---|---|
+| `PAPER_AGENT_REPO_ROOT` | `/Users/chenyuan/Documents/develop/paper-assistant` | 运行 `uv`、pytest、mypy 和 Alembic |
+| `PAPER_AGENT_PROJECT_ROOT` | `/Users/chenyuan/Documents/develop/paperAgentTest` | 已初始化并 ingest 论文的项目；保存 Project Manifest 和 Artifact Blob |
+
+准备环境：
+
+```bash
+export PAPER_AGENT_REPO_ROOT="/Users/chenyuan/Documents/develop/paper-assistant"
+export PAPER_AGENT_PROJECT_ROOT="/Users/chenyuan/Documents/develop/paperAgentTest"
+
+cd "$PAPER_AGENT_REPO_ROOT"
+set -a
+source .env
+set +a
+
+test -f "$PAPER_AGENT_REPO_ROOT/pyproject.toml" && echo "repo root: OK"
+test -f "$PAPER_AGENT_PROJECT_ROOT/.paper-agent/project.json" && echo "project root: OK"
+```
+
+除 `paper-agent --root` 明确接收论文项目目录外，下面的命令均在代码仓库根目录执行。
+
+### 6.1 依赖、静态检查和迁移头
 
 ```bash
 uv sync --extra dev
 uv run mypy src
 uv run alembic heads
+git diff --check
 ```
 
-预期：依赖安装成功；mypy 输出 `Success: no issues found`；Alembic 只显示 `0011_rod_hardening (head)`。
+预期：
 
-### 6.2 Artifact / Offload / Hydrate 单元测试
+- mypy 输出 `Success: no issues found`；当前检查 127 个源码文件。
+- Alembic 只输出 `0011_rod_hardening (head)`。
+- 本次重构复用现有字符串类型字段和 0009～0011 表，不新增 Migration。
+- `git diff --check` 无输出。
+
+### 6.2 ROD、Worker、并行调度和 Provider 单元测试
+
+先运行新纵切：
 
 ```bash
-uv run pytest tests/unit/artifacts tests/unit/agent/test_artifact_tool_adapters.py -ra
-uv run pytest tests/unit/agent/test_runtime_offload.py tests/unit/agent/test_tool_adapters.py -ra
-uv run pytest tests/unit/providers/test_mimo_provider.py -ra
+uv run pytest \
+  tests/unit/rag/test_rod_rag.py \
+  tests/unit/delegation \
+  -ra
 ```
 
-预期全部通过，覆盖：小结果 Inline、大结果和二进制结果 Offload；严格模型预算；Blob gzip/Hash 校验及损坏自修复；相同内容共享 Blob 但保留不同 Worker provenance；`read_artifact` 无递归 Offload、合法 View/Cursor 分页、超大 JSON 无损恢复、跨项目/越界/非法 Cursor/Worker 越权被拒绝；Checkpoint 中仅保存 compact payload；OpenAI/MiMo 读取 passage/element 而非已删除的旧 evidence 键。
+预期全部通过，覆盖：
 
-### 6.3 Delegate 单元测试
+- 一个选中的 Evidence Chunk 对应一个 `retrieved_evidence` Artifact。
+- 主 Agent Payload 中没有原始 Chunk 正文。
+- 每个 Chunk 对应一个 `chunk_analysis` WorkUnit。
+- `chunk_analyst` 只能使用 `read_artifact`，且只能读取一个获授权 Artifact。
+- Worker Claim 的 Citation 必须属于输入 Artifact 的 Citation Manifest。
+- 同一 DAG 层的独立 WorkUnit 在 `max_workers` 上限内并行。
+- WorkUnit 最多重试一次；依赖层仍按拓扑顺序执行。
+- 第一轮 partial/irrelevant 时只改写一次 Query；第二轮仍不足返回
+  `insufficient`，不会把模型记忆当作论文事实。
+- Retrieve 无候选时直接返回 `no_evidence`，不创建 Worker。
+- 相同 Session、Query 重放复用稳定 Task、Artifact 和 WorkUnit ID。
+
+再运行 Artifact、Agent Runtime 和 OpenAI/MiMo 兼容测试：
 
 ```bash
-uv run pytest tests/unit/delegation -ra
+uv run pytest \
+  tests/unit/artifacts \
+  tests/unit/agent \
+  tests/unit/providers/test_mimo_provider.py \
+  tests/unit/test_project_manifest_and_cli.py \
+  -ra
 ```
 
-预期全部通过，覆盖：简单请求拒绝委派、6～20 篇或显式 workstream 允许委派；确定性 Task/WorkUnit generation key；验证 WorkUnit 的 DAG 依赖和 Artifact 注入；失败最多重试一次；实际 ToolCall/Token/时间预算；论文与 Artifact 白名单；递归输出 Schema；未知/歧义/缺失 Citation 拒绝；`verified` verdict 拒绝；未解决问题可由 collect 恢复。
+预期全部通过。重点检查：
 
-### 6.4 PostgreSQL / Redis 集成测试
+- 默认 `build_agent_runtime` 只向标准 ask 暴露
+  `retrieve_and_analyze_knowledge`。
+- `--rag-mode direct` 才保留旧 Search/Read/Artifact/Delegate 工具集合。
+- OpenAI 和 MiMo 在 ROD Collect 返回 supported/insufficient 后隐藏工具并进入合成。
+- MiMo 的文本形式 `<tool_call>` 仍会被规范化；畸形或未执行标记被拒绝。
+- supported 答案必须引用 Manifest；insufficient/no_evidence 的模型输出会被确定性替换为
+  `no_evidence：<reason>`。
+- Checkpoint 只保存紧凑 Worker Report、Claim、ArtifactReference 和 Citation Manifest。
 
-先提供空的测试库和 Redis（下面端口仅为示例）：
+### 6.3 PostgreSQL ROD 纵切
+
+需要 PostgreSQL 16 和 pgvector。下面使用隔离端口，避免连接日常数据库：
 
 ```bash
-docker run --name paper-agent-test-postgres -e POSTGRES_PASSWORD=paper_agent -e POSTGRES_DB=paper_agent_test -p 55432:5432 -d postgres:16
-docker run --name paper-agent-test-redis -p 56379:6379 -d redis:7
+docker run --name paper-agent-test-postgres \
+  -e POSTGRES_PASSWORD=paper_agent \
+  -e POSTGRES_DB=paper_agent_test \
+  -p 55432:5432 \
+  -d pgvector/pgvector:pg16
+
 export PAPER_AGENT_TEST_DATABASE_URL='postgresql+psycopg://postgres:paper_agent@localhost:55432/paper_agent_test'
-export PAPER_AGENT_TEST_REDIS_URL='redis://localhost:56379/0'
-uv run paper-agent db-upgrade --database-url "$PAPER_AGENT_TEST_DATABASE_URL"
+
+uv run paper-agent db-upgrade \
+  --database-url "$PAPER_AGENT_TEST_DATABASE_URL"
 ```
 
-预期：两个容器进入 running；迁移命令输出 `Database upgraded to head.`。
+预期容器为 running，迁移命令输出 `Database upgraded to head.`。
 
-执行 retrieve-offload-delegate 的数据库纵切：
+执行：
 
 ```bash
-uv run pytest tests/integration/test_postgres_metadata.py tests/integration/test_postgres_artifacts.py tests/integration/test_postgres_research_tasks.py tests/integration/test_e2e_offload_delegate.py -ra
-uv run pytest tests/integration/test_redis_compact_checkpoint.py tests/integration/test_redis_session_state.py -ra
+uv run pytest \
+  tests/integration/test_postgres_metadata.py \
+  tests/integration/test_postgres_artifacts.py \
+  tests/integration/test_postgres_research_tasks.py \
+  tests/integration/test_e2e_offload_delegate.py \
+  tests/integration/test_e2e_retrieve_offload_delegate.py \
+  -ra
 ```
 
-预期无 skip、全部通过。PostgreSQL 组验证 0011 约束、Artifact provenance、Task/WorkUnit 幂等、真实 Offload→Hydrate 和 Delegate→Collect；Redis 组验证恢复时不重复工具调用，且不保存完整比较矩阵/Worker 正文。
+预期无 skip、全部通过。新的
+`test_e2e_retrieve_offload_delegate.py` 验证：
+
+- 1 个 `rag_evidence_analysis` ResearchTask。
+- N 个 `retrieved_evidence` Artifact。
+- N 个 `chunk_analysis` WorkUnit。
+- N 个成功 Worker 对应的 `worker_result` Artifact。
+- Task → Evidence Artifact → WorkUnit → Worker Artifact provenance 完整。
+- 相同 Project/User/Session/Query 重放不会重复创建 Task、WorkUnit 或 Artifact。
+- 其他 `project_id` 不能读取 Task 或 Artifact。
+
+本次开发环境没有可用的 PostgreSQL 测试服务，因此该组当前未执行并在全量测试中
+显示为 skip；不能据此声称 PostgreSQL 集成已经通过。
+
+### 6.4 Redis Checkpoint 集成
+
+如果没有现成测试 Redis，可启动隔离实例：
+
+```bash
+docker run --name paper-agent-test-redis -p 56379:6379 -d redis:7
+export PAPER_AGENT_TEST_REDIS_URL='redis://localhost:56379/15'
+```
+
+如果 Redis 开启密码认证，`PAPER_AGENT_TEST_REDIS_URL` 必须使用带认证信息的完整 URL，
+但不要把凭据提交到仓库。
+
+执行：
+
+```bash
+uv run pytest \
+  tests/integration/test_redis_compact_checkpoint.py \
+  tests/integration/test_redis_session_state.py \
+  -ra
+```
+
+预期 3 个测试全部通过，验证 TTL、Checkpoint/Session round-trip，以及 ROD Checkpoint
+不保存 retrieved Chunk 正文。本次开发使用本机带认证 Redis 的隔离 DB 15 实际执行结果为：
+
+```text
+3 passed
+```
 
 ### 6.5 全量回归
+
+同时设置 PostgreSQL 和 Redis 测试 URL 后执行：
 
 ```bash
 uv run pytest -ra
@@ -228,48 +364,167 @@ uv run mypy src
 git diff --check
 ```
 
-预期：配置了 PostgreSQL/Redis 后全部测试通过且无环境型 skip；mypy 成功；`git diff --check` 无输出。未配置两个测试服务时，相关集成测试应明确显示为 skip，而不是失败。
+预期全部测试通过且无环境型 skip；mypy 成功；`git diff --check` 无输出。
 
-### 6.6 CLI 人工验收
+没有设置外部服务时，PostgreSQL/Redis 集成测试必须明确显示为 skip，而不是伪装成
+已通过。本次无外部测试变量的实际基线为：
 
-准备至少 6 个已经 ingest 的 paper UUID，并设置模型、数据库和 Redis：
-
-```bash
-export PAPER_AGENT_LLM_MODEL='<可用模型名>'
-export PAPER_AGENT_LLM_PROVIDER='openai'
-export PAPER_AGENT_REDIS_URL="$PAPER_AGENT_TEST_REDIS_URL"
-export PAPER_ID_1='<uuid>' PAPER_ID_2='<uuid>' PAPER_ID_3='<uuid>'
-export PAPER_ID_4='<uuid>' PAPER_ID_5='<uuid>' PAPER_ID_6='<uuid>'
+```text
+160 passed, 20 skipped
+Success: no issues found in 127 source files
+0011_rod_hardening (head)
 ```
 
-简单请求不得 Delegate：
+其中 skip 全部来自缺少 `PAPER_AGENT_TEST_DATABASE_URL` 或
+`PAPER_AGENT_TEST_REDIS_URL`；Redis 组随后按 6.4 使用认证配置单独执行并通过。
+启用本机认证 Redis、但仍未配置 PostgreSQL 时，本次全量实际结果为：
 
-```bash
-uv run paper-agent delegate --root "$PWD" --database-url "$PAPER_AGENT_TEST_DATABASE_URL" '比较两篇论文' --paper-id "$PAPER_ID_1" --paper-id "$PAPER_ID_2"
+```text
+163 passed, 17 skipped
 ```
 
-预期退出码 1，JSON 为 `delegated: false`，reason 表明 2～5 篇比较使用主 Agent + Offload。
+这 17 个 skip 全部是 PostgreSQL 集成测试，不能算作通过。
 
-显式工作流必须完成 Delegate→Collect：
+### 6.6 标准 ask CLI 人工验收
 
-```bash
-uv run paper-agent delegate --root "$PWD" --database-url "$PAPER_AGENT_TEST_DATABASE_URL" '比较方法并列出证据不足项' --paper-id "$PAPER_ID_1" --paper-id "$PAPER_ID_2" --workstream method --max-workers 2 --model "$PAPER_AGENT_LLM_MODEL" --provider "$PAPER_AGENT_LLM_PROVIDER"
-```
+CLI 人工验收必须使用已经 ingest 论文的日常项目和数据库，不要把空的
+`paper_agent_test` 当成论文语料库。
 
-预期退出码 0；输出同时含 `delegation` 和 `collected`；task_id 一致，status 为 `completed` 或存在可解释失败项的 `partially_completed`；每个成功 WorkUnit 只有 ArtifactReference，`unresolved_questions` 不丢失。
-
-6 篇默认批处理必须触发委派并执行验证 DAG：
+先确认数据：
 
 ```bash
-uv run paper-agent delegate --root "$PWD" --database-url "$PAPER_AGENT_TEST_DATABASE_URL" '系统比较六篇论文的方法、数据集、结果与局限，并核验证据' --paper-id "$PAPER_ID_1" --paper-id "$PAPER_ID_2" --paper-id "$PAPER_ID_3" --paper-id "$PAPER_ID_4" --paper-id "$PAPER_ID_5" --paper-id "$PAPER_ID_6" --max-workers 3 --model "$PAPER_AGENT_LLM_MODEL" --provider "$PAPER_AGENT_LLM_PROVIDER"
+uv run paper-agent status \
+  --root "$PAPER_AGENT_PROJECT_ROOT" \
+  --database-url "$PAPER_AGENT_DATABASE_URL"
 ```
 
-预期产生确定性 WorkUnit 列表；verification 最后执行并只能读取前置 Worker Artifact；最终只汇总紧凑摘要、ArtifactReference、Citation Manifest、未解决问题和失败项。
+预期 `files`、`papers` 和 `chunks` 均大于 0。若全部为 0，应先检查数据库 URL 和
+Project Manifest，不要对日常项目重新执行 `init`。
 
-最后通过主 Agent 验收 search_artifact/read_artifact 控制面：
+设置标准 RAG 预算：
 
 ```bash
-uv run paper-agent ask --root "$PWD" --database-url "$PAPER_AGENT_TEST_DATABASE_URL" --redis-url "$PAPER_AGENT_REDIS_URL" --model "$PAPER_AGENT_LLM_MODEL" --provider "$PAPER_AGENT_LLM_PROVIDER" '先检索刚才的研究 Artifact；如果摘要不足，选择 available_views 中的视图分页读取，然后基于 Citation Manifest 回答。'
+export PAPER_AGENT_RAG_MODE='retrieve-offload-delegate'
+export PAPER_AGENT_RAG_MAX_EVIDENCE='6'
+export PAPER_AGENT_RAG_MAX_PER_PAPER='2'
+export PAPER_AGENT_RAG_MAX_WORKERS='3'
+export PAPER_AGENT_RAG_MAX_ROUNDS='2'
+export PAPER_AGENT_RAG_WORKER_TOKEN_BUDGET='1200'
+export PAPER_AGENT_RAG_WORKER_TOOL_CALL_BUDGET='2'
+export PAPER_AGENT_RAG_WORKER_TIMEOUT_SECONDS='90'
 ```
 
-预期退出码 0；Agent 能先 search_artifact，再按需 read_artifact；分页结果的 `token_count` 不超过请求上限，`next_cursor` 可继续读取，最终答案只使用返回过的引用标签。
+用 MiMo 执行普通论文问答：
+
+```bash
+export PAPER_AGENT_LLM_PROVIDER='mimo'
+export PAPER_AGENT_LLM_MODEL='mimo-v2.5-pro'
+
+uv run paper-agent ask \
+  --root "$PAPER_AGENT_PROJECT_ROOT" \
+  --database-url "$PAPER_AGENT_DATABASE_URL" \
+  --redis-url "$PAPER_AGENT_REDIS_URL" \
+  --provider "$PAPER_AGENT_LLM_PROVIDER" \
+  --model "$PAPER_AGENT_LLM_MODEL" \
+  --rag-mode retrieve-offload-delegate \
+  --trace summary \
+  '2D-TAN 的主要方法是什么？请给出论文证据。'
+```
+
+用户不需要执行 `delegate`，也不需要提供任何 Paper ID。预期：
+
+- stdout 只包含最终 JSON，不混入 Trace。
+- stderr 依次出现 `rag.retrieve.started`、`rag.retrieve.completed`、
+  `rag.artifact.created`、`rag.delegate.started`、`rag.worker.started`、
+  `rag.worker.completed`、`rag.collect.completed`、
+  `rag.sufficiency.checked`、`rag.synthesis.started` 和
+  `rag.answer.validated`。
+- 每个回答中的 `[E编号]` 都存在于 Worker 返回的 Citation Manifest。
+- 最终答案不包含 `<tool_call>`、`<function=...>` 或
+  `<parameter=...>`。
+- 第一轮充分时只执行一轮；第一轮不足时最多执行一次改写后的第二轮。
+- 第二轮仍不足时 stdout 中的 answer 以 `no_evidence` 开头。
+
+机器可读 Trace：
+
+```bash
+uv run paper-agent ask \
+  --root "$PAPER_AGENT_PROJECT_ROOT" \
+  --database-url "$PAPER_AGENT_DATABASE_URL" \
+  --redis-url "$PAPER_AGENT_REDIS_URL" \
+  --provider "$PAPER_AGENT_LLM_PROVIDER" \
+  --model "$PAPER_AGENT_LLM_MODEL" \
+  --trace jsonl \
+  '2D-TAN 的主要方法是什么？请给出论文证据。' \
+  2> /tmp/paper-agent-rag-trace.jsonl
+```
+
+预期 `/tmp/paper-agent-rag-trace.jsonl` 每行都是一个 JSON Event，且 Event 中不包含
+Chunk `text`、Artifact Blob 或 Worker 完整执行历史。
+
+OpenAI 使用相同路径，只替换 Provider 和模型：
+
+```bash
+uv run paper-agent ask \
+  --root "$PAPER_AGENT_PROJECT_ROOT" \
+  --database-url "$PAPER_AGENT_DATABASE_URL" \
+  --redis-url "$PAPER_AGENT_REDIS_URL" \
+  --provider openai \
+  --model "$OPENAI_CHAT_MODEL" \
+  --trace summary \
+  '2D-TAN 的主要方法是什么？请给出论文证据。'
+```
+
+OpenAI 与 MiMo 的 Artifact、WorkUnit、Citation 和 no_evidence 验收标准完全相同。
+
+### 6.7 数据库侧验收
+
+一次有证据的 ask 完成后，在日常 PostgreSQL 会话中执行：
+
+```sql
+SELECT task_id, session_id, status, plan_json
+FROM research_tasks
+WHERE task_type = 'rag_evidence_analysis'
+ORDER BY created_at DESC
+LIMIT 5;
+
+SELECT artifact_type, count(*)
+FROM research_artifacts
+WHERE research_task_id = '<上一步 task_id>'
+GROUP BY artifact_type
+ORDER BY artifact_type;
+
+SELECT work_type, requested_worker, status, count(*)
+FROM work_units
+WHERE task_id = '<上一步 task_id>'
+GROUP BY work_type, requested_worker, status;
+```
+
+预期：
+
+- Task 的 `plan_json` 为 retrieve/chunk_analysis/collect。
+- `retrieved_evidence` 数量与选中的去重 Chunk 数一致。
+- `chunk_analysis + chunk_analyst` WorkUnit 数量与 Evidence Artifact 数一致。
+- 每个成功 WorkUnit 有一个 `output_artifact_id` 指向 `worker_result`。
+- 同一个 Session/Query 重放后数量不增长。
+- Artifact Blob 位于
+  `$PAPER_AGENT_PROJECT_ROOT/.paper-agent/artifacts/blobs/sha256/`，而不是代码仓库。
+
+### 6.8 direct 回滚/对照模式
+
+`direct` 只用于故障回滚和评测对照，不是普通用户默认路径：
+
+```bash
+uv run paper-agent ask \
+  --root "$PAPER_AGENT_PROJECT_ROOT" \
+  --database-url "$PAPER_AGENT_DATABASE_URL" \
+  --redis-url "$PAPER_AGENT_REDIS_URL" \
+  --provider "$PAPER_AGENT_LLM_PROVIDER" \
+  --model "$PAPER_AGENT_LLM_MODEL" \
+  --rag-mode direct \
+  '2D-TAN 的主要方法是什么？'
+```
+
+预期 direct 模式保留旧的 Search/Read/Artifact/Delegate 工具行为；默认不传
+`--rag-mode` 时必须走 Retrieve–Offload–Delegate。显式 `paper-agent delegate`
+仍可用于高级批量研究和调试，但不再是标准 RAG 人工验收步骤。

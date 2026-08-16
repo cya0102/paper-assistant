@@ -1,6 +1,7 @@
 """Application assembly for ingestion, retrieval, reading, and Agent Runtime."""
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 from uuid import UUID
 
@@ -41,6 +42,9 @@ from paper_agent.agent.delegation_tool_adapters import (
     CollectResearchTaskToolAdapter,
     DelegateResearchToolAdapter,
 )
+from paper_agent.agent.rod_tool_adapter import (
+    RetrieveAndAnalyzeKnowledgeToolAdapter,
+)
 from paper_agent.delegation.collector import ResultCollector
 from paper_agent.delegation.policy import DelegationPolicy
 from paper_agent.delegation.scheduler import Scheduler
@@ -73,6 +77,17 @@ from paper_agent.research_graph import (
     LexicalEntailmentJudge,
     ResearchGraphService,
     RuleBasedPaperProfileExtractor,
+)
+from paper_agent.rag import (
+    EvidenceArtifactMaterializer,
+    NullRagTracer,
+    RagConfig,
+    RagTraceEvent,
+    RagTracer,
+    RagWorkUnitPlanner,
+    RetrieveOffloadDelegateAnswerFinalizer,
+    RetrieveOffloadDelegateService,
+    RodResultCollector,
 )
 
 
@@ -161,6 +176,8 @@ def build_agent_runtime(
     project_root: Path | None = None,
     user_id: UUID | None = None,
     session_id: UUID | None = None,
+    rag_mode: str | None = None,
+    rag_tracer: RagTracer | None = None,
 ) -> AgentRuntime:
     project_root = (project_root or Path.cwd()).resolve()
     engine = create_engine(database_url, pool_pre_ping=True)
@@ -174,51 +191,177 @@ def build_agent_runtime(
         retention_days=policy.config.artifact_retention_days,
     )
     materializer = ToolResultMaterializer(artifacts, policy)
-    tools = ToolRegistry()
-    tools.register(SearchKnowledgeToolAdapter(search_service, project_id).contract())
-    tools.register(ReadPaperToolAdapter(read_service, project_id).contract())
-    tools.register(
-        ComparePapersToolAdapter(
-            build_comparison_service(database_url=database_url), project_id
-        ).contract()
-    )
-    tools.register(
-        ReadArtifactToolAdapter(
-            artifacts,
-            project_id,
-            max_tokens_cap=policy.config.read_artifact_max_tokens,
-        ).contract()
-    )
-    tools.register(SearchArtifactToolAdapter(artifacts, project_id).contract())
     llm = _language_model(provider=provider, model=model)
     redis_client: Redis = Redis.from_url(redis_url, decode_responses=True)
-    if user_id is not None:
-        task_service = build_research_task_service(
+    tools = ToolRegistry()
+    selected_rag_mode = (
+        rag_mode
+        or os.environ.get(
+            "PAPER_AGENT_RAG_MODE", "retrieve-offload-delegate"
+        )
+    ).strip().lower()
+    tracer = rag_tracer or NullRagTracer()
+    required_tool_name: str | None = None
+    answer_finalizer: object
+    if selected_rag_mode == "retrieve-offload-delegate":
+        if user_id is None or session_id is None:
+            raise ValueError(
+                "retrieve-offload-delegate mode requires user_id and session_id"
+            )
+        rod_service = build_retrieve_offload_delegate_service(
             database_url=database_url,
             project_root=project_root,
             redis_url=redis_url,
             model=llm,
             search_service=search_service,
-            read_service=read_service,
             artifacts=artifacts,
             materializer=materializer,
+            tracer=tracer,
+            worker_model_factory=lambda: _language_model(
+                provider=provider, model=model
+            ),
         )
         tools.register(
-            DelegateResearchToolAdapter(
-                task_service, project_id, user_id, session_id
+            RetrieveAndAnalyzeKnowledgeToolAdapter(
+                rod_service,
+                project_id=project_id,
+                user_id=user_id,
+                session_id=session_id,
+            ).contract()
+        )
+        required_tool_name = "retrieve_and_analyze_knowledge"
+        answer_finalizer = RetrieveOffloadDelegateAnswerFinalizer()
+    elif selected_rag_mode == "direct":
+        tools.register(
+            SearchKnowledgeToolAdapter(search_service, project_id).contract()
+        )
+        tools.register(ReadPaperToolAdapter(read_service, project_id).contract())
+        tools.register(
+            ComparePapersToolAdapter(
+                build_comparison_service(database_url=database_url), project_id
             ).contract()
         )
         tools.register(
-            CollectResearchTaskToolAdapter(task_service, project_id).contract()
+            ReadArtifactToolAdapter(
+                artifacts,
+                project_id,
+                max_tokens_cap=policy.config.read_artifact_max_tokens,
+            ).contract()
+        )
+        tools.register(SearchArtifactToolAdapter(artifacts, project_id).contract())
+        if user_id is not None:
+            task_service = build_research_task_service(
+                database_url=database_url,
+                project_root=project_root,
+                redis_url=redis_url,
+                model=llm,
+                search_service=search_service,
+                read_service=read_service,
+                artifacts=artifacts,
+                materializer=materializer,
+            )
+            tools.register(
+                DelegateResearchToolAdapter(
+                    task_service, project_id, user_id, session_id
+                ).contract()
+            )
+            tools.register(
+                CollectResearchTaskToolAdapter(task_service, project_id).contract()
+            )
+        answer_finalizer = ToolEvidenceCitationFormatter()
+    else:
+        raise ValueError(
+            "rag_mode must be retrieve-offload-delegate or direct"
         )
     return AgentRuntime(
         llm,
         tools,
         RedisCheckpointStore(redis_client),
-        answer_finalizer=ToolEvidenceCitationFormatter(),
+        answer_finalizer=answer_finalizer,
         sessions=RedisSessionStore(redis_client),
         memory=SqlAlchemyMemoryRepository(session_factory),
         materializer=materializer,
+        required_tool_name=required_tool_name,
+        answer_observer=lambda _answer, _results: tracer.emit(
+            RagTraceEvent(
+                event="rag.answer.validated",
+                details={"rag_mode": selected_rag_mode},
+            )
+        ),
+    )
+
+
+def build_retrieve_offload_delegate_service(
+    *,
+    database_url: str,
+    project_root: Path,
+    redis_url: str,
+    model: LanguageModel,
+    search_service: object | None = None,
+    artifacts: ArtifactService | None = None,
+    materializer: ToolResultMaterializer | None = None,
+    config: RagConfig | None = None,
+    tracer: RagTracer | None = None,
+    worker_model_factory: Callable[[], LanguageModel] | None = None,
+) -> RetrieveOffloadDelegateService:
+    """Assemble the standard RAG service without binding Domain to providers."""
+    config = config or _rag_config_from_environment()
+    engine = create_engine(database_url, pool_pre_ping=True)
+    session_factory = sessionmaker(engine, class_=Session, expire_on_commit=False)
+    policy = OffloadPolicy()
+    artifacts = artifacts or ArtifactService(
+        LocalArtifactBlobStore(project_root),
+        SqlAlchemyArtifactRepository(session_factory),
+        retention_days=policy.config.artifact_retention_days,
+    )
+    materializer = materializer or ToolResultMaterializer(artifacts, policy)
+    search_service = search_service or build_search_knowledge_service(
+        database_url=database_url
+    )
+    runner = WorkerRunner(
+        registry=build_worker_registry(),
+        model=model,
+        checkpoints=RedisCheckpointStore(
+            Redis.from_url(redis_url, decode_responses=True)
+        ),
+        artifacts=artifacts,
+        materializer=materializer,
+        search_service=search_service,
+        read_service=build_read_paper_service(database_url=database_url),
+        model_factory=worker_model_factory,
+    )
+    return RetrieveOffloadDelegateService(
+        search=search_service,  # type: ignore[arg-type]
+        repository=SqlAlchemyResearchTaskRepository(session_factory),
+        scheduler=Scheduler(
+            runner, max_attempts=2, max_workers=config.max_workers
+        ),
+        evidence_materializer=EvidenceArtifactMaterializer(artifacts),
+        planner=RagWorkUnitPlanner(config),
+        collector=RodResultCollector(artifacts),
+        config=config,
+        tracer=tracer,
+    )
+
+
+def _rag_config_from_environment() -> RagConfig:
+    def integer(name: str, default: int) -> int:
+        return int(os.environ.get(name, str(default)))
+
+    return RagConfig(
+        max_evidence=integer("PAPER_AGENT_RAG_MAX_EVIDENCE", 6),
+        max_per_paper=integer("PAPER_AGENT_RAG_MAX_PER_PAPER", 2),
+        max_workers=integer("PAPER_AGENT_RAG_MAX_WORKERS", 3),
+        max_rounds=integer("PAPER_AGENT_RAG_MAX_ROUNDS", 2),
+        worker_token_budget=integer(
+            "PAPER_AGENT_RAG_WORKER_TOKEN_BUDGET", 1200
+        ),
+        worker_tool_call_budget=integer(
+            "PAPER_AGENT_RAG_WORKER_TOOL_CALL_BUDGET", 2
+        ),
+        worker_timeout_seconds=integer(
+            "PAPER_AGENT_RAG_WORKER_TIMEOUT_SECONDS", 90
+        ),
     )
 
 
