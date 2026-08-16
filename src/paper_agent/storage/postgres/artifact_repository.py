@@ -3,7 +3,7 @@
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import delete, func, select, update
@@ -99,12 +99,7 @@ class SqlAlchemyArtifactRepository:
         with self._session_factory.begin() as session:
             statement = insert(ResearchArtifactRow).values(**_row_values(descriptor))
             statement = statement.on_conflict_do_nothing(
-                index_elements=[
-                    "project_id",
-                    "artifact_type",
-                    "schema_version",
-                    "content_hash",
-                ]
+                index_elements=["artifact_id"]
             )
             session.execute(statement)
             row = session.scalar(
@@ -114,16 +109,15 @@ class SqlAlchemyArtifactRepository:
                 )
             )
             if row is None:
-                row = session.scalar(
-                    select(ResearchArtifactRow).where(
-                        ResearchArtifactRow.project_id == descriptor.project_id,
-                        ResearchArtifactRow.artifact_type == descriptor.artifact_type.value,
-                        ResearchArtifactRow.schema_version == descriptor.schema_version,
-                        ResearchArtifactRow.content_hash == descriptor.content_hash,
-                    )
-                )
-            if row is None:
                 raise LookupError("Artifact insert did not persist")
+            # The deterministic artifact_id makes an exact retry idempotent. If
+            # the prior instance expired or was marked corrupt, refresh the same
+            # provenance record after its blob has been repaired and verified.
+            values = _row_values(descriptor)
+            for key, value in values.items():
+                if key not in {"artifact_id", "project_id", "created_at"}:
+                    setattr(row, key, value)
+            session.flush()
             if citations:
                 self._replace_citations(session, descriptor.project_id, row, citations)
             stored = _descriptor_from_row(row)
@@ -159,12 +153,15 @@ class SqlAlchemyArtifactRepository:
     ) -> ArtifactDescriptor | None:
         with self._session_factory() as session:
             row = session.scalar(
-                select(ResearchArtifactRow).where(
+                select(ResearchArtifactRow)
+                .where(
                     ResearchArtifactRow.project_id == project_id,
                     ResearchArtifactRow.artifact_type == artifact_type.value,
                     ResearchArtifactRow.schema_version == schema_version,
                     ResearchArtifactRow.content_hash == content_hash,
                 )
+                .order_by(ResearchArtifactRow.created_at.desc())
+                .limit(1)
             )
             if row is None:
                 return None
@@ -216,6 +213,25 @@ class SqlAlchemyArtifactRepository:
 
             return int(cast("CursorResult[Any]", result).rowcount or 0)
 
+    def update_status(
+        self, project_id: UUID, artifact_id: UUID, status: ArtifactStatus
+    ) -> None:
+        with self._session_factory.begin() as session:
+            result = session.execute(
+                update(ResearchArtifactRow)
+                .where(
+                    ResearchArtifactRow.project_id == project_id,
+                    ResearchArtifactRow.artifact_id == artifact_id,
+                )
+                .values(status=status.value)
+            )
+            from typing import cast
+
+            from sqlalchemy.engine import CursorResult
+
+            if int(cast("CursorResult[Any]", result).rowcount or 0) != 1:
+                raise LookupError("Artifact not found in project")
+
     def search(
         self,
         project_id: UUID,
@@ -229,7 +245,12 @@ class SqlAlchemyArtifactRepository:
     ) -> tuple[ArtifactDescriptor, ...]:
         with self._session_factory() as session:
             statement = select(ResearchArtifactRow).where(
-                ResearchArtifactRow.project_id == project_id
+                ResearchArtifactRow.project_id == project_id,
+                ResearchArtifactRow.status == ArtifactStatus.ACTIVE.value,
+                (
+                    ResearchArtifactRow.expires_at.is_(None)
+                    | (ResearchArtifactRow.expires_at >= datetime.now(UTC))
+                ),
             )
             if artifact_type is not None:
                 statement = statement.where(

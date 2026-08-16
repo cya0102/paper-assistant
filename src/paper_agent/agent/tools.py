@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 
-ToolHandler = Callable[[dict[str, Any]], dict[str, Any]]
+ToolPayload = dict[str, Any] | bytes
+ToolHandler = Callable[[dict[str, Any]], ToolPayload]
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +35,7 @@ class ToolRegistry:
             raise ValueError(f"Tool already registered: {contract.name}")
         self._tools[contract.name] = contract
 
-    def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def execute(self, name: str, arguments: dict[str, Any]) -> ToolPayload:
         try:
             tool = self._tools[name]
         except KeyError as error:
@@ -43,4 +44,3 @@ class ToolRegistry:
 
     def model_specs(self) -> tuple[dict[str, object], ...]:
         return tuple(tool.model_spec() for tool in self._tools.values())
-

@@ -933,12 +933,12 @@ class ResearchArtifactRow(Base):
 
     __tablename__ = "research_artifacts"
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "ix_research_artifacts_project_type_schema_hash",
             "project_id",
             "artifact_type",
             "schema_version",
             "content_hash",
-            name="uq_research_artifacts_project_type_schema_hash",
         ),
         Index("ix_research_artifacts_project_artifact", "project_id", "artifact_id"),
         Index("ix_research_artifacts_created_by", "created_by"),
@@ -1018,6 +1018,11 @@ class ArtifactCitationRow(Base):
 class ResearchTaskRow(Base):
     __tablename__ = "research_tasks"
     __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "generation_key",
+            name="uq_research_tasks_project_generation_key",
+        ),
         Index("ix_research_tasks_project_status", "project_id", "status"),
         Index("ix_research_tasks_session", "session_id"),
     )

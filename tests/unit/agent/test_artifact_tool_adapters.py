@@ -104,6 +104,39 @@ def test_read_artifact_rejects_bad_view_and_huge_budget(tmp_path: Path) -> None:
     assert adapter.execute(
         {"artifact_id": str(descriptor.artifact_id), "max_tokens": 99999}
     )["error"] == "invalid_request"
+    assert adapter.execute(
+        {"artifact_id": str(descriptor.artifact_id), "cursor": "not-a-cursor"}
+    )["error"] == "artifact_invalid_view"
+
+
+def test_worker_read_artifact_enforces_input_whitelist(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    project_id = uuid4()
+    allowed = service.materialize(
+        project_id=project_id,
+        artifact_type=ArtifactType.TOOL_RESULT,
+        schema_version="v1",
+        media_type="application/json",
+        payload={"allowed": True},
+        summary="allowed",
+    )
+    denied = service.materialize(
+        project_id=project_id,
+        artifact_type=ArtifactType.TOOL_RESULT,
+        schema_version="v1",
+        media_type="application/json",
+        payload={"allowed": False},
+        summary="denied",
+    )
+    adapter = ReadArtifactToolAdapter(
+        service,
+        project_id,
+        allowed_artifact_ids=(allowed.artifact_id,),
+    )
+    assert "error" not in adapter.execute({"artifact_id": str(allowed.artifact_id)})
+    assert adapter.execute({"artifact_id": str(denied.artifact_id)})["error"] == (
+        "artifact_not_in_worker_scope"
+    )
 
 
 def test_search_artifact_structured_filters(tmp_path: Path) -> None:

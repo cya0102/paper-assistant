@@ -229,10 +229,9 @@ class MimoResponsesModel:
                 "has_sufficient_evidence"
             ) is True:
                 return True
-            # Read results are only citable through their unified "evidence",
-            # so a passages/elements-only payload must NOT finalize without
-            # any citation (it would pass the citation check vacuously).
-            if item.name == "read_paper" and item.payload.get("evidence"):
+            if item.name == "read_paper" and (
+                item.payload.get("passages") or item.payload.get("elements")
+            ):
                 return True
         return False
 

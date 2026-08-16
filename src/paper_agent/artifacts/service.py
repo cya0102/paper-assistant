@@ -38,6 +38,34 @@ def canonical_json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _string_values(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, dict):
+        result: set[str] = set()
+        for child in value.values():
+            result.update(_string_values(child))
+        return result
+    if isinstance(value, (list, tuple)):
+        result = set()
+        for child in value:
+            result.update(_string_values(child))
+        return result
+    return set()
+
+
+def _content_contains_citation(content: Any, citation_label: str) -> bool:
+    for value in _string_values(content):
+        if value == citation_label:
+            return True
+        # Lossless JSON-fragment views carry a serialized subsection as a
+        # string. Match only a complete quoted JSON value, not an arbitrary
+        # substring such as E1 inside E10.
+        if json.dumps(citation_label, ensure_ascii=False) in value:
+            return True
+    return False
+
+
 class ArtifactService:
     def __init__(
         self,
@@ -73,23 +101,42 @@ class ArtifactService:
         byte_size = len(canonical.encode("utf-8"))
         if token_estimate is None:
             token_estimate = count_tokens(canonical)
-        existing = self._repository.find_by_hash(
-            project_id, artifact_type, schema_version, content_hash
+        if expires_at is None:
+            expires_at = datetime.now(UTC) + timedelta(days=self._retention_days)
+        identity_context = ":".join(
+            str(value) if value is not None else "-"
+            for value in (
+                session_id,
+                research_task_id,
+                work_unit_id,
+                tool_call_id,
+            )
         )
+        artifact_id = uuid5(
+            NAMESPACE_URL,
+            (
+                f"artifact:{project_id}:{artifact_type.value}:{schema_version}:"
+                f"{content_hash}:{identity_context}"
+            ),
+        )
+        existing = self._repository.get(project_id, artifact_id)
         if existing is not None:
-            # Content-addressed dedup: an idempotent retry of the same call
-            # must not create a second active Artifact.
-            return existing
+            now = datetime.now(UTC)
+            active = existing.status == ArtifactStatus.ACTIVE and (
+                existing.expires_at is None or existing.expires_at >= now
+            )
+            if active:
+                try:
+                    stored = self._blob_store.get(storage_key=existing.storage_key)
+                except PaperAgentError:
+                    stored = b""
+                if sha256(stored).hexdigest() == existing.content_hash:
+                    return existing
         storage_key = self._blob_store.put(
             content_hash=content_hash, data=canonical.encode("utf-8")
         )
-        if expires_at is None:
-            expires_at = datetime.now(UTC) + timedelta(days=self._retention_days)
         descriptor = ArtifactDescriptor(
-            artifact_id=uuid5(
-                NAMESPACE_URL,
-                f"artifact:{project_id}:{artifact_type.value}:{schema_version}:{content_hash}",
-            ),
+            artifact_id=artifact_id,
             project_id=project_id,
             artifact_type=artifact_type,
             schema_version=schema_version,
@@ -128,6 +175,7 @@ class ArtifactService:
         if descriptor.status == ArtifactStatus.EXPIRED or (
             descriptor.expires_at is not None and descriptor.expires_at < now
         ):
+            self._repository.mark_expired(now=now)
             raise ArtifactAccessError(
                 ErrorCode.ARTIFACT_EXPIRED, "Artifact has expired"
             )
@@ -138,10 +186,20 @@ class ArtifactService:
                 raise ArtifactAccessError(
                     ErrorCode.ARTIFACT_NOT_FOUND, "Artifact blob is missing"
                 ) from error
+            self._repository.update_status(
+                selector.project_id,
+                selector.artifact_id,
+                ArtifactStatus.CORRUPT,
+            )
             raise ArtifactAccessError(
                 ErrorCode.ARTIFACT_CORRUPT, "Artifact blob is corrupt"
             ) from error
         if sha256(data).hexdigest() != descriptor.content_hash:
+            self._repository.update_status(
+                selector.project_id,
+                selector.artifact_id,
+                ArtifactStatus.CORRUPT,
+            )
             raise ArtifactAccessError(
                 ErrorCode.ARTIFACT_CORRUPT, "Artifact blob hash mismatch"
             )
@@ -153,12 +211,17 @@ class ArtifactService:
             selector.cursor,
             selector.max_tokens,
         )
+        citations = tuple(
+            citation
+            for citation in descriptor.citation_manifest
+            if _content_contains_citation(content, citation.citation_label)
+        )
         return ArtifactSlice(
             artifact_id=descriptor.artifact_id,
             project_id=descriptor.project_id,
             view=selector.view,
             content=content,
-            citations=descriptor.citation_manifest,
+            citations=citations,
             next_cursor=next_cursor,
             truncated=truncated,
             token_count=token_count,
@@ -175,6 +238,7 @@ class ArtifactService:
         query: str | None = None,
         limit: int = 20,
     ) -> tuple[ArtifactDescriptor, ...]:
+        self._repository.mark_expired(now=datetime.now(UTC))
         return self._repository.search(
             project_id,
             artifact_type=artifact_type,

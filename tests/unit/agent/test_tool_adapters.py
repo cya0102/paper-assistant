@@ -2,7 +2,12 @@ from uuid import uuid4
 
 import hashlib
 
-from paper_agent.agent.tool_adapters import ReadPaperToolAdapter
+import pytest
+
+from paper_agent.agent.tool_adapters import (
+    ReadPaperToolAdapter,
+    SearchKnowledgeToolAdapter,
+)
 from paper_agent.domain.enums import ElementType
 from paper_agent.domain.reading import ReadElement, ReadPaperResult, ReadPassage
 
@@ -72,3 +77,34 @@ def test_read_serialize_keeps_single_source_of_text_and_citations():
         "The codebook clusters scene features.".encode()
     ).hexdigest()
     assert element_ref.chunk_id is None
+
+
+def test_worker_search_defaults_to_assigned_scope_and_rejects_escape():
+    assigned = (uuid4(), uuid4())
+
+    class SearchService:
+        request = None
+
+        def search_knowledge(self, request):
+            from paper_agent.domain.enums import SearchStatus
+            from paper_agent.domain.retrieval import SearchKnowledgeResult
+
+            self.request = request
+            return SearchKnowledgeResult(
+                query=request.query,
+                status=SearchStatus.NO_EVIDENCE,
+                resolved_papers=(),
+                evidence=(),
+                has_sufficient_evidence=False,
+            )
+
+    service = SearchService()
+    adapter = SearchKnowledgeToolAdapter(
+        service,
+        uuid4(),
+        paper_scope=assigned,
+    )
+    adapter.execute({"query": "method"})
+    assert service.request.scope.paper_ids == assigned
+    with pytest.raises(ValueError, match="outside"):
+        adapter.execute({"query": "method", "paper_ids": [str(uuid4())]})

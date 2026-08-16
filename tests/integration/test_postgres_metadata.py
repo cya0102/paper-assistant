@@ -136,6 +136,23 @@ def test_research_graph_schema_keeps_queryable_fields_and_evidence_provenance() 
     }
 
 
+def test_artifact_and_task_idempotency_constraints_are_registered() -> None:
+    artifacts = Base.metadata.tables["research_artifacts"]
+    assert "ix_research_artifacts_project_type_schema_hash" in {
+        index.name for index in artifacts.indexes
+    }
+    assert "uq_research_artifacts_project_type_schema_hash" not in {
+        constraint.name for constraint in artifacts.constraints
+    }
+    tasks = Base.metadata.tables["research_tasks"]
+    assert any(
+        constraint.name == "uq_research_tasks_project_generation_key"
+        and {column.name for column in constraint.columns}
+        == {"project_id", "generation_key"}
+        for constraint in tasks.constraints
+    )
+
+
 def test_postgresql_schema_emits_circular_canonical_version_fk() -> None:
     statements: list[str] = []
 

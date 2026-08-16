@@ -33,7 +33,12 @@ class SearchKnowledgeToolAdapter:
         if self._paper_scope is None:
             return requested
         allowed = set(self._paper_scope)
-        return tuple(dict.fromkeys(value for value in requested if value in allowed))
+        if not requested:
+            return tuple(dict.fromkeys(self._paper_scope))
+        outside = tuple(value for value in requested if value not in allowed)
+        if outside:
+            raise ValueError("Requested paper is outside this worker's assigned scope")
+        return tuple(dict.fromkeys(requested))
 
     def contract(self) -> ToolContract:
         return ToolContract(

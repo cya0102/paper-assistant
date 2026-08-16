@@ -31,6 +31,11 @@ def _validate_optional_uuid(value: object, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a UUID or None")
 
 
+def _validate_uuid(value: object, field_name: str) -> None:
+    if not isinstance(value, UUID):
+        raise ValueError(f"{field_name} must be a UUID")
+
+
 def _validate_page_range(page_start: int | None, page_end: int | None) -> None:
     if page_start is None and page_end is None:
         return
@@ -82,6 +87,8 @@ class CitationReference:
     element_id: UUID | None = None
 
     def __post_init__(self) -> None:
+        _validate_uuid(self.paper_id, "paper_id")
+        _validate_uuid(self.version_id, "version_id")
         _require_text(self.citation_label, "citation_label")
         _require_text(self.paper_title, "paper_title")
         _require_text(self.section_path, "section_path")
@@ -122,6 +129,8 @@ class ArtifactDescriptor:
     expires_at: datetime | None = None
 
     def __post_init__(self) -> None:
+        _validate_uuid(self.artifact_id, "artifact_id")
+        _validate_uuid(self.project_id, "project_id")
         _require_text(self.schema_version, "schema_version")
         _require_text(self.media_type, "media_type")
         _require_text(self.storage_backend, "storage_backend")
@@ -144,8 +153,9 @@ class ArtifactDescriptor:
             raise ValueError("tool_call_id cannot be blank")
         if self.expires_at is not None and self.expires_at < self.created_at:
             raise ValueError("expires_at cannot precede created_at")
-        if self.status == ArtifactStatus.ACTIVE and self.expires_at is not None and self.expires_at < datetime.now(UTC):
-            raise ValueError("Active artifact cannot already be expired")
+        # ACTIVE is the persisted catalog state; ArtifactService lazily turns it
+        # into EXPIRED on read/search. Domain construction must therefore remain
+        # valid when the wall clock advances past expires_at.
         labels = [item.citation_label for item in self.citation_manifest]
         if len(labels) != len(set(labels)):
             raise ValueError("citation_manifest labels must be unique")
@@ -164,6 +174,17 @@ class ArtifactReference:
     created_by: str
     created_at: datetime
     available_views: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _validate_uuid(self.artifact_id, "artifact_id")
+        _validate_uuid(self.project_id, "project_id")
+        if self.byte_size < 0 or self.token_estimate < 0:
+            raise ValueError("ArtifactReference sizes cannot be negative")
+        _require_text(self.media_type, "media_type")
+        _require_text(self.summary, "summary")
+        _require_text(self.created_by, "created_by")
+        if any(not view.strip() for view in self.available_views):
+            raise ValueError("available_views cannot contain blank values")
 
     @classmethod
     def from_descriptor(
@@ -192,6 +213,8 @@ class ArtifactSelector:
     max_tokens: int = 800
 
     def __post_init__(self) -> None:
+        _validate_uuid(self.artifact_id, "artifact_id")
+        _validate_uuid(self.project_id, "project_id")
         if not self.view.strip():
             raise ValueError("view cannot be blank")
         if self.cursor is not None and not self.cursor.strip():
@@ -212,6 +235,8 @@ class ArtifactSlice:
     token_count: int
 
     def __post_init__(self) -> None:
+        _validate_uuid(self.artifact_id, "artifact_id")
+        _validate_uuid(self.project_id, "project_id")
         if self.token_count < 0:
             raise ValueError("token_count cannot be negative")
 
@@ -345,4 +370,3 @@ def descriptor_from_dict(raw: dict[str, Any]) -> ArtifactDescriptor:
         tool_call_id=raw.get("tool_call_id"),
         expires_at=_parse_iso(raw.get("expires_at")),
     )
-

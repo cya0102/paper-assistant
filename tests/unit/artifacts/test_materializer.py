@@ -100,6 +100,49 @@ def test_manifest_built_before_offload(materializer: ToolResultMaterializer) -> 
     assert manifest[0].evidence_hash is not None
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "payload", "required_fields"),
+    [
+        (
+            "delegate_research",
+            {
+                "delegated": True,
+                "task_id": str(uuid4()),
+                "status": "completed",
+                "detail": "word " * 1000,
+            },
+            ("delegated", "task_id", "status", "artifact_ref"),
+        ),
+        (
+            "collect_research_task",
+            {
+                "task_id": str(uuid4()),
+                "status": "completed",
+                "summary": "word " * 1000,
+                "artifact_refs": [],
+                "unresolved_questions": ["Q1"],
+                "failed_work_units": [],
+            },
+            ("task_id", "status", "artifact_ref"),
+        ),
+    ],
+)
+def test_offloaded_control_tools_keep_routing_fields(
+    materializer: ToolResultMaterializer,
+    tool_name: str,
+    payload: dict,
+    required_fields: tuple[str, ...],
+) -> None:
+    result = materializer.materialize(
+        project_id=uuid4(),
+        session_id=uuid4(),
+        call=ToolCall("control", tool_name, {}),
+        raw_payload=payload,
+    )
+    assert result.artifact_ref is not None
+    assert all(field in result.model_payload for field in required_fields)
+
+
 def test_read_manifest_and_no_duplicate_text(materializer: ToolResultMaterializer) -> None:
     paper_id, version_id = uuid4(), uuid4()
     payload = {
@@ -221,3 +264,17 @@ def test_accumulated_budget_forces_offload(materializer: ToolResultMaterializer)
         accumulated_tokens=1500,
     )
     assert result.artifact_ref is not None
+
+
+def test_binary_result_is_encoded_and_offloaded(
+    materializer: ToolResultMaterializer,
+) -> None:
+    result = materializer.materialize(
+        project_id=uuid4(),
+        session_id=uuid4(),
+        call=ToolCall("binary-1", "export_binary", {}),
+        raw_payload=b"\x00\x01binary",
+    )
+    assert result.artifact_ref is not None
+    assert result.artifact_ref.media_type == "application/octet-stream"
+    assert "data_base64" not in result.model_payload

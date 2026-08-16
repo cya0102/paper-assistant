@@ -37,26 +37,95 @@ class Scheduler:
         if running:
             task = replace(task, status=ResearchTaskStatus.RUNNING, updated_at=datetime.now(UTC))
             repository.save_task(task)
-        completed: dict[UUID, WorkUnit] = {}
-        updated: list[WorkUnit] = []
-        for unit in units:
-            if unit.status == WorkUnitStatus.COMPLETED:
-                completed[unit.work_unit_id] = unit
-                updated.append(unit)
-                continue
-            if not all(dep in completed for dep in unit.dependency_ids):
-                skipped = replace(unit, status=WorkUnitStatus.SKIPPED, updated_at=datetime.now(UTC))
-                repository.update_work_unit(
-                    task.project_id, unit.work_unit_id, status=WorkUnitStatus.SKIPPED.value
+        by_id = {unit.work_unit_id: unit for unit in units}
+        updated: dict[UUID, WorkUnit] = {
+            unit.work_unit_id: unit
+            for unit in units
+            if unit.status == WorkUnitStatus.COMPLETED
+        }
+        completed: dict[UUID, WorkUnit] = dict(updated)
+        remaining = [
+            unit for unit in units if unit.status != WorkUnitStatus.COMPLETED
+        ]
+        while remaining:
+            progressed = False
+            for unit in tuple(remaining):
+                missing = [dep for dep in unit.dependency_ids if dep not in by_id]
+                failed_dependencies = [
+                    dep
+                    for dep in unit.dependency_ids
+                    if dep in updated
+                    and updated[dep].status
+                    in {WorkUnitStatus.FAILED, WorkUnitStatus.SKIPPED}
+                ]
+                if missing or failed_dependencies:
+                    skipped = replace(
+                        unit,
+                        status=WorkUnitStatus.SKIPPED,
+                        error="dependency_failed_or_missing",
+                        updated_at=datetime.now(UTC),
+                    )
+                    repository.update_work_unit(
+                        task.project_id,
+                        unit.work_unit_id,
+                        status=WorkUnitStatus.SKIPPED.value,
+                        error=skipped.error,
+                    )
+                    updated[unit.work_unit_id] = skipped
+                    remaining.remove(unit)
+                    progressed = True
+                    continue
+                if not all(dep in completed for dep in unit.dependency_ids):
+                    continue
+                dependency_artifacts: list[UUID] = []
+                for dependency_id in unit.dependency_ids:
+                    output_artifact_id = completed[
+                        dependency_id
+                    ].output_artifact_id
+                    if output_artifact_id is not None:
+                        dependency_artifacts.append(output_artifact_id)
+                runnable = replace(
+                    unit,
+                    input_artifact_ids=tuple(
+                        dict.fromkeys(
+                            (*unit.input_artifact_ids, *dependency_artifacts)
+                        )
+                    ),
+                    updated_at=datetime.now(UTC),
                 )
-                updated.append(skipped)
-                continue
-            finished = self._run_with_retry(unit, repository, user_id)
-            if finished.status == WorkUnitStatus.COMPLETED:
-                completed[finished.work_unit_id] = finished
-            updated.append(finished)
-        result_task = self._finalize_task(task, tuple(updated), repository)
-        return result_task, tuple(updated)
+                if runnable.input_artifact_ids != unit.input_artifact_ids:
+                    repository.update_work_unit(
+                        runnable.project_id,
+                        runnable.work_unit_id,
+                        input_artifact_ids=runnable.input_artifact_ids,
+                    )
+                finished = self._run_with_retry(runnable, repository, user_id)
+                updated[finished.work_unit_id] = finished
+                if finished.status == WorkUnitStatus.COMPLETED:
+                    completed[finished.work_unit_id] = finished
+                remaining.remove(unit)
+                progressed = True
+            if not progressed:
+                # The remaining graph contains a cycle. Fail it deterministically
+                # rather than depending on input ordering or looping forever.
+                for unit in remaining:
+                    skipped = replace(
+                        unit,
+                        status=WorkUnitStatus.SKIPPED,
+                        error="dependency_cycle",
+                        updated_at=datetime.now(UTC),
+                    )
+                    repository.update_work_unit(
+                        task.project_id,
+                        unit.work_unit_id,
+                        status=WorkUnitStatus.SKIPPED.value,
+                        error=skipped.error,
+                    )
+                    updated[unit.work_unit_id] = skipped
+                remaining.clear()
+        ordered = tuple(updated[unit.work_unit_id] for unit in units)
+        result_task = self._finalize_task(task, ordered, repository)
+        return result_task, ordered
 
     def _run_with_retry(
         self,
@@ -65,7 +134,9 @@ class Scheduler:
         user_id: UUID,
     ) -> WorkUnit:
         attempts = 0
-        while attempts < self._max_attempts:
+        remaining_attempts = max(0, self._max_attempts - unit.attempt_count)
+        last_error = unit.error or "work unit exhausted its retry budget"
+        while attempts < remaining_attempts:
             attempts += 1
             running = replace(
                 unit,
@@ -100,16 +171,17 @@ class Scheduler:
                     error=None,
                 )
                 return finished
+            last_error = result.error or "worker failed without an error"
             repository.update_work_unit(
                 running.project_id,
                 running.work_unit_id,
-                error=result.error,
+                error=last_error,
             )
         failed = replace(
             unit,
             status=WorkUnitStatus.FAILED,
-            attempt_count=unit.attempt_count + self._max_attempts,
-            error=result.error,
+            attempt_count=unit.attempt_count + remaining_attempts,
+            error=last_error,
             updated_at=datetime.now(UTC),
         )
         repository.update_work_unit(

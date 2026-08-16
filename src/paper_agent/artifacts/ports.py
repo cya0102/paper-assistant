@@ -10,6 +10,7 @@ from paper_agent.domain.artifact import (
     ArtifactSelector,
     ArtifactSlice,
     ArtifactType,
+    ArtifactStatus,
     CitationReference,
 )
 
@@ -59,6 +60,10 @@ class ArtifactRepository(Protocol):
     ) -> tuple[CitationReference, ...]: ...
 
     def mark_expired(self, *, now: datetime) -> int: ...
+
+    def update_status(
+        self, project_id: UUID, artifact_id: UUID, status: ArtifactStatus
+    ) -> None: ...
 
     def search(
         self,

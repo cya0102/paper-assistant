@@ -9,7 +9,7 @@ own budgets plus a stable generation_key for idempotent execution.
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from paper_agent.research_tasks.domain import (
     ResearchTask,
@@ -74,6 +74,11 @@ class ResearchPlanner:
         units: list[WorkUnit] = []
         for workstream in selected:
             worker = worker_for_workstream(workstream)
+            dependencies = (
+                tuple(unit.work_unit_id for unit in units)
+                if worker == "evidence_verifier"
+                else ()
+            )
             objective = self._objective_for(
                 task.task_type, workstream, paper_ids, task.research_question
             )
@@ -81,7 +86,10 @@ class ResearchPlanner:
             schema = output_schema_for(worker, workstream)
             units.append(
                 WorkUnit(
-                    work_unit_id=uuid4(),
+                    work_unit_id=uuid5(
+                        NAMESPACE_URL,
+                        f"work-unit:{task.task_id}:{workstream}",
+                    ),
                     task_id=task.task_id,
                     project_id=task.project_id,
                     work_type=workstream,
@@ -96,12 +104,14 @@ class ResearchPlanner:
                         input_artifact_ids=input_artifact_ids,
                         requested_worker=worker,
                         output_schema=schema,
+                        dependency_ids=dependencies,
                     ),
                     token_budget=budget.token_budget,
                     tool_call_budget=budget.tool_call_budget,
                     timeout_seconds=budget.timeout_seconds,
                     paper_ids=paper_ids,
                     input_artifact_ids=input_artifact_ids,
+                    dependency_ids=dependencies,
                     allowed_tools=allowed_tools_for(worker),
                     output_schema=schema,
                     created_at=datetime.now(UTC),
@@ -145,7 +155,15 @@ def output_schema_for(worker: str, workstream: str) -> dict[str, Any]:
             "type": "object",
             "properties": {
                 "workstream": {"type": "string"},
-                "verdict": {"type": "string"},
+                "verdict": {
+                    "type": "string",
+                    "enum": [
+                        "supported",
+                        "contradicted",
+                        "insufficient",
+                        "unreviewed",
+                    ],
+                },
                 "findings": {"type": "array", "items": {"type": "string"}},
                 "citations": {"type": "array", "items": {"type": "string"}},
                 "unresolved_questions": {"type": "array", "items": {"type": "string"}},

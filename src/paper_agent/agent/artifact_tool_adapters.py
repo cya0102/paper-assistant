@@ -25,10 +25,16 @@ class ReadArtifactToolAdapter:
         project_id: UUID,
         *,
         max_tokens_cap: int = 4000,
+        allowed_artifact_ids: tuple[UUID, ...] | None = None,
     ) -> None:
         self._artifacts = artifacts
         self._project_id = project_id
         self._max_tokens_cap = max_tokens_cap
+        self._allowed_artifact_ids = (
+            frozenset(allowed_artifact_ids)
+            if allowed_artifact_ids is not None
+            else None
+        )
 
     def contract(self) -> ToolContract:
         return ToolContract(
@@ -58,13 +64,27 @@ class ReadArtifactToolAdapter:
 
     def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
+            artifact_id = UUID(str(arguments["artifact_id"]))
+            if (
+                self._allowed_artifact_ids is not None
+                and artifact_id not in self._allowed_artifact_ids
+            ):
+                return {
+                    "error": "artifact_not_in_worker_scope",
+                    "message": "Artifact is outside this worker's assigned inputs",
+                }
+            max_tokens = int(arguments.get("max_tokens", 800))
+            if max_tokens > self._max_tokens_cap:
+                raise ValueError(
+                    f"max_tokens cannot exceed {self._max_tokens_cap}"
+                )
             result = self._artifacts.read_slice(
                 ArtifactSelector(
-                    artifact_id=UUID(str(arguments["artifact_id"])),
+                    artifact_id=artifact_id,
                     project_id=self._project_id,
                     view=str(arguments.get("view", "default")),
                     cursor=arguments.get("cursor"),
-                    max_tokens=int(arguments.get("max_tokens", 800)),
+                    max_tokens=max_tokens,
                 )
             )
         except PaperAgentError as error:

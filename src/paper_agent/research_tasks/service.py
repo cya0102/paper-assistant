@@ -69,6 +69,22 @@ class ResearchTaskService:
         requested_workstreams: tuple[str, ...] = (),
         max_workers: int | None = None,
     ) -> dict[str, Any]:
+        objective = objective.strip()
+        requested_workstreams = tuple(
+            workstream.strip() for workstream in requested_workstreams
+        )
+        if not objective:
+            raise ValueError("objective cannot be blank")
+        if not 1 <= len(paper_ids) <= 20:
+            raise ValueError("delegation requires between 1 and 20 papers")
+        if len(paper_ids) != len(set(paper_ids)):
+            raise ValueError("paper_ids must be unique")
+        if len(requested_workstreams) > 12:
+            raise ValueError("requested_workstreams cannot exceed 12 entries")
+        if any(not workstream for workstream in requested_workstreams):
+            raise ValueError("requested_workstreams cannot contain blank entries")
+        if len(requested_workstreams) != len(set(requested_workstreams)):
+            raise ValueError("requested_workstreams must be unique")
         decision = self._policy.decide(
             paper_ids=paper_ids,
             requested_workstreams=requested_workstreams,
@@ -82,14 +98,14 @@ class ResearchTaskService:
             session_id=session_id,
             objective=objective,
             decision=decision,
+            paper_ids=paper_ids,
         )
         units = self._planner.plan(
             task=task,
             paper_ids=paper_ids,
             workstreams=decision.workstreams,
         )
-        for unit in units:
-            self._repository.save_work_unit(unit)
+        units = tuple(self._repository.save_work_unit(unit) for unit in units)
         updated_task, updated_units = self._scheduler.run(
             task=task,
             units=units,
@@ -131,6 +147,7 @@ class ResearchTaskService:
         session_id: UUID | None,
         objective: str,
         decision: DelegationDecision,
+        paper_ids: tuple[UUID, ...],
     ) -> ResearchTask:
         task_type = infer_task_type(decision.workstreams)
         plan = decision.workstreams or default_plan_for(task_type)
@@ -140,6 +157,7 @@ class ResearchTaskService:
             research_question=objective,
             task_type=task_type,
             plan=plan,
+            paper_ids=paper_ids,
         )
         existing = self._repository.find_task_by_generation_key(
             project_id, generation_key
@@ -166,7 +184,6 @@ class ResearchTaskService:
         )
         return self._repository.save_task(task)
 
-    @staticmethod
     @staticmethod
     def _task_summary(
         task: ResearchTask, units: tuple[WorkUnit, ...]

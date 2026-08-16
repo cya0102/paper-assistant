@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Callable
+from time import monotonic
 from uuid import UUID
 
 from paper_agent.agent.ports import AgentCheckpointStore, LanguageModel, MemoryRepository, SessionStore
@@ -31,6 +32,8 @@ class AgentRuntime:
         sessions: SessionStore | None = None,
         memory: MemoryRepository | None = None,
         materializer: ToolResultMaterializer | None = None,
+        max_tool_calls: int | None = None,
+        timeout_seconds: int | None = None,
     ) -> None:
         self._model = model
         self._tools = tools
@@ -40,6 +43,8 @@ class AgentRuntime:
         self._sessions = sessions
         self._memory = memory
         self._materializer = materializer
+        self._max_tool_calls = max_tool_calls
+        self._timeout_seconds = timeout_seconds
 
     def run(
         self,
@@ -49,6 +54,7 @@ class AgentRuntime:
         project_id: UUID,
         query: str,
     ) -> AgentAnswer:
+        started_at = monotonic()
         checkpoint = self._checkpoints.load(session_id)
         if checkpoint is None or checkpoint.status in {AgentRunStatus.COMPLETED, AgentRunStatus.FAILED}:
             messages: list[ConversationMessage] = []
@@ -73,7 +79,13 @@ class AgentRuntime:
             if checkpoint.user_id != user_id or checkpoint.project_id != project_id:
                 raise ValueError("Session checkpoint identity mismatch")
             turn = self._resume_turn(checkpoint)
-        return self._drive(checkpoint, turn)
+        try:
+            return self._drive(checkpoint, turn, started_at=started_at)
+        except TimeoutError as error:
+            checkpoint.status = AgentRunStatus.FAILED
+            checkpoint.error = str(error)
+            self._checkpoints.save(checkpoint)
+            raise
 
     def _resume_turn(self, checkpoint: AgentCheckpoint) -> ModelTurn:
         if checkpoint.pending_calls:
@@ -83,8 +95,15 @@ class AgentRuntime:
             return self._model.start(checkpoint, self._tools.model_specs())
         return self._model.continue_with_tools(checkpoint, completed, self._tools.model_specs())
 
-    def _drive(self, checkpoint: AgentCheckpoint, turn: ModelTurn) -> AgentAnswer:
+    def _drive(
+        self,
+        checkpoint: AgentCheckpoint,
+        turn: ModelTurn,
+        *,
+        started_at: float,
+    ) -> AgentAnswer:
         while True:
+            self._check_deadline(started_at)
             if checkpoint.step >= self._max_steps:
                 checkpoint.status = AgentRunStatus.FAILED
                 checkpoint.error = "Agent loop exceeded max_steps"
@@ -123,6 +142,17 @@ class AgentRuntime:
             for call in tuple(checkpoint.pending_calls):
                 if call.call_id in completed_call_ids:
                     continue
+                if (
+                    self._max_tool_calls is not None
+                    and len(checkpoint.tool_results) >= self._max_tool_calls
+                ):
+                    checkpoint.status = AgentRunStatus.FAILED
+                    checkpoint.error = (
+                        f"Agent exceeded tool_call_budget={self._max_tool_calls}"
+                    )
+                    self._checkpoints.save(checkpoint)
+                    raise RuntimeError(checkpoint.error)
+                self._check_deadline(started_at)
                 try:
                     raw_payload = self._tools.execute(call.name, call.arguments)
                     if self._materializer is not None:
@@ -138,6 +168,10 @@ class AgentRuntime:
                             accumulated_tokens=accumulated,
                         )
                     else:
+                        if isinstance(raw_payload, bytes):
+                            raise ValueError(
+                                "Binary tool results require a ToolResultMaterializer"
+                            )
                         result = ToolResult(
                             call_id=call.call_id,
                             name=call.name,
@@ -154,6 +188,7 @@ class AgentRuntime:
                 checkpoint.pending_response_results.append(result)
                 checkpoint.pending_calls = [item for item in checkpoint.pending_calls if item.call_id != call.call_id]
                 self._checkpoints.save(checkpoint)
+                self._check_deadline(started_at)
             checkpoint.status = AgentRunStatus.RUNNING
             self._checkpoints.save(checkpoint)
             turn = self._model.continue_with_tools(
@@ -162,6 +197,15 @@ class AgentRuntime:
                 self._tools.model_specs(),
             )
             checkpoint.pending_response_results = []
+
+    def _check_deadline(self, started_at: float) -> None:
+        if (
+            self._timeout_seconds is not None
+            and monotonic() - started_at > self._timeout_seconds
+        ):
+            raise TimeoutError(
+                f"Agent exceeded timeout_seconds={self._timeout_seconds}"
+            )
 
     def _persist_memory(self, checkpoint: AgentCheckpoint, answer: str) -> None:
         paper_ids: list[UUID] = []

@@ -91,11 +91,18 @@ class SqlAlchemyResearchTaskRepository:
                     created_at=task.created_at,
                     updated_at=task.updated_at,
                 )
-                statement = statement.on_conflict_do_nothing(
-                    index_elements=["task_id"]
-                )
+                # Handle both the idempotency key and a concurrent insert of
+                # the same deterministic primary key, then load the winner.
+                statement = statement.on_conflict_do_nothing()
                 session.execute(statement)
                 row = session.get(ResearchTaskRow, task.task_id)
+                if row is None:
+                    row = session.scalar(
+                        select(ResearchTaskRow).where(
+                            ResearchTaskRow.project_id == task.project_id,
+                            ResearchTaskRow.generation_key == task.generation_key,
+                        )
+                    )
             else:
                 row.status = task.status.value
                 row.updated_at = datetime.now(UTC)
@@ -156,9 +163,7 @@ class SqlAlchemyResearchTaskRepository:
                 created_at=unit.created_at,
                 updated_at=unit.updated_at,
             )
-            statement = statement.on_conflict_do_nothing(
-                index_elements=["task_id", "generation_key"]
-            )
+            statement = statement.on_conflict_do_nothing()
             session.execute(statement)
             row = session.get(WorkUnitRow, unit.work_unit_id)
             if row is None:
@@ -207,6 +212,7 @@ class SqlAlchemyResearchTaskRepository:
         attempt_count: int | None = None,
         output_artifact_id: UUID | None = None,
         error: str | None = None,
+        input_artifact_ids: tuple[UUID, ...] | None = None,
     ) -> WorkUnit:
         with self._session_factory.begin() as session:
             row = session.scalar(
@@ -223,8 +229,14 @@ class SqlAlchemyResearchTaskRepository:
                 row.attempt_count = attempt_count
             if output_artifact_id is not None:
                 row.output_artifact_id = output_artifact_id
+            if input_artifact_ids is not None:
+                row.input_artifact_ids_json = [
+                    str(value) for value in input_artifact_ids
+                ]
             if error is not None:
                 row.error = error
+            elif status == WorkUnitStatus.COMPLETED.value:
+                row.error = None
             row.updated_at = datetime.now(UTC)
             session.flush()
             return _unit_from_row(row)

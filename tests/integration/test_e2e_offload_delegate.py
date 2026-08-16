@@ -230,6 +230,7 @@ def test_delegate_workflow_persists_and_collects(stack, tmp_path: Path) -> None:
     assert collected["status"] == "completed"
     assert collected["summary"]
     assert len(collected["artifact_refs"]) == 1
+    assert collected["unresolved_questions"] == ["Q1"]
     # worker artifact readable through the artifact service
     from paper_agent.domain.artifact import ArtifactSelector
 

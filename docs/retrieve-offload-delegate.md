@@ -62,15 +62,17 @@ src/paper_agent/
 - 标准库 gzip 压缩（mtime=0，确定性字节）。
 - 临时文件 + os.replace 原子重命名。
 - 读取时重新校验 SHA-256，损坏抛 ARTIFACT_CORRUPT。
-- Blob 成功写入后才提交数据库 Catalog；内容哈希唯一约束保证幂等重试不产生重复 Artifact。
+- Blob 成功写入并校验后才提交数据库 Catalog；Blob 按内容哈希去重，Artifact Catalog 则按 session/task/work-unit/tool-call provenance 生成确定性 ID。相同上下文重试复用同一 Artifact，不同 Worker 即使输出完全相同，也保留不同 Catalog 记录并共享同一 Blob。
+- 已存在但损坏的同址 Blob 会通过原子替换自修复；读取发现损坏时 Catalog 状态持久化为 `corrupt`。
 - 实现 ArtifactBlobStore 端口，未来可切换 S3/Object Storage。
 
 ### PostgreSQL Catalog
 
-迁移 0009_context_artifacts 新增：
+迁移 0009_context_artifacts 新增基础表，迁移 0011_rod_hardening 修正 provenance 与幂等约束：
 
-- research_artifacts：唯一约束 (project_id, artifact_type, schema_version, content_hash)。
+- research_artifacts：`(project_id, artifact_type, schema_version, content_hash)` 为普通检索索引，不再是唯一约束；Catalog 实例保留各自 provenance，底层 Blob 仍内容寻址去重。
 - artifact_citations：artifact_id + project_id + citation_label 等；Citation Finalizer 只凭清单校验引用。
+- research_tasks：唯一约束 `(project_id, generation_key)`，并发或重放不会创建重复任务。
 
 ## 2. ToolResult 重构
 
@@ -111,7 +113,7 @@ Tool.execute
 | artifact_retention_days | 30 |
 | read_artifact_max_tokens | 4000 |
 
-规则：小于单结果预算可 Inline；超过预算、二进制结果、compare_papers > 5 篇、read_paper 整章/多页、Worker 结果 → 始终 Offload；同一 Model Payload 不重复相同正文。
+规则：小于单结果预算可 Inline；超过预算、二进制结果、compare_papers > 5 篇、read_paper 整章/多页、Worker 结果 → 始终 Offload；同一 Model Payload 不重复相同正文。二进制结果以带 media type、byte size 和 base64 的 JSON envelope 存储，原始二进制不会进入 Provider 或 Checkpoint。`read_artifact` 返回的已经是服务端限额后的 Slice，不会被再次 Offload；`delegate_research`、`collect_research_task`、`search_artifact` 保留控制字段，不会被通用压缩器剥掉 task_id 或 ArtifactReference。
 
 ## 3. 现有 Tool 的模型视图
 
@@ -121,7 +123,7 @@ Tool.execute
 
 ## 4. read_artifact / search_artifact
 
-read_artifact：artifact_id、view、cursor、max_tokens。project_id 由 Adapter 绑定；max_tokens 有严格上限；支持 Cursor 分页；跨项目/过期/损坏返回稳定错误码。不允许任意文件路径或 JSONPath。
+read_artifact：artifact_id、view、cursor、max_tokens。project_id 由 Adapter 绑定；max_tokens 有严格上限；支持 Cursor 分页；超大单项和 full/report/result 视图会返回可无损拼接的 JSON fragment；非法/越界 Cursor 被拒绝。跨项目/过期/损坏返回稳定错误码。不允许任意文件路径或 JSONPath。Worker 还会额外校验 `allowed_artifact_ids`，不能读取未分配的 Artifact。
 
 search_artifact：MVP 结构化过滤（query/artifact_type/created_by/max_results）。
 
@@ -148,9 +150,9 @@ search_artifact：MVP 结构化过滤（query/artifact_type/created_by/max_resul
 ```text
 delegate_research
 → DelegationPolicy 判定
-→ ResearchPlanner 生成确定性 WorkUnit DAG
-→ Scheduler（同步、单层、依赖感知、最多重试一次）
-→ WorkerRunner：隔离 Checkpoint + 专属简报 + 锁定工具 + Schema 校验
+→ ResearchPlanner 生成确定性 WorkUnit DAG（验证单元依赖所有前置分析单元）
+→ Scheduler（同步、单层、拓扑调度、依赖 Artifact 注入、最多重试一次）
+→ WorkerRunner：隔离 Checkpoint + 专属简报 + 论文/Artifact 白名单 + 锁定工具 + 递归 Schema/Citation 校验 + ToolCall/Token/时间预算
 → ArtifactService 保存 Worker Artifact（始终 Offload）
 → collect_research_task：紧凑摘要 + artifact_refs + Citation Manifest + 未解决问题 + 失败 WorkUnit
 ```
@@ -163,15 +165,111 @@ delegate_research
 - WorkUnit 最多自动重试一次；使用稳定 Generation Key 保证幂等。
 - 主 Agent 不接收 Worker 完整执行轨迹。
 
-## 6. 验证
+## 6. 验证指令与预期结果
+
+以下命令均在仓库根目录执行。
+
+### 6.1 安装、静态检查与迁移链
 
 ```bash
-uv run pytest                          # 单元 + 集成（需要 PAPER_AGENT_TEST_DATABASE_URL / PAPER_AGENT_TEST_REDIS_URL）
-uv run mypy src                        # strict
+uv sync --extra dev
+uv run mypy src
+uv run alembic heads
 ```
 
-关键回归点：
+预期：依赖安装成功；mypy 输出 `Success: no issues found`；Alembic 只显示 `0011_rod_hardening (head)`。
 
-- 小结果 Inline、大结果 Offload、Artifact 无损恢复、gzip 生效、Hash 损坏拒绝读取、跨 Project 拒绝、内容 Hash 去重、过期稳定报错、read_artifact 支持 View/Cursor/max_tokens。
-- Checkpoint 恢复不重复 Tool Call；Redis 不保存完整比较矩阵；OpenAI/MiMo 只接收 model_payload；Citation Finalizer 使用 Manifest。
-- 20 篇比较仍满足上下文预算；简单请求不触发 Delegate；Worker 只收到最小上下文；Worker 输出被 ArtifactService 保存；主 Agent 只收到 ArtifactReference；evidence_verifier 不能把 insufficient 标记为 verified。
+### 6.2 Artifact / Offload / Hydrate 单元测试
+
+```bash
+uv run pytest tests/unit/artifacts tests/unit/agent/test_artifact_tool_adapters.py -ra
+uv run pytest tests/unit/agent/test_runtime_offload.py tests/unit/agent/test_tool_adapters.py -ra
+uv run pytest tests/unit/providers/test_mimo_provider.py -ra
+```
+
+预期全部通过，覆盖：小结果 Inline、大结果和二进制结果 Offload；严格模型预算；Blob gzip/Hash 校验及损坏自修复；相同内容共享 Blob 但保留不同 Worker provenance；`read_artifact` 无递归 Offload、合法 View/Cursor 分页、超大 JSON 无损恢复、跨项目/越界/非法 Cursor/Worker 越权被拒绝；Checkpoint 中仅保存 compact payload；OpenAI/MiMo 读取 passage/element 而非已删除的旧 evidence 键。
+
+### 6.3 Delegate 单元测试
+
+```bash
+uv run pytest tests/unit/delegation -ra
+```
+
+预期全部通过，覆盖：简单请求拒绝委派、6～20 篇或显式 workstream 允许委派；确定性 Task/WorkUnit generation key；验证 WorkUnit 的 DAG 依赖和 Artifact 注入；失败最多重试一次；实际 ToolCall/Token/时间预算；论文与 Artifact 白名单；递归输出 Schema；未知/歧义/缺失 Citation 拒绝；`verified` verdict 拒绝；未解决问题可由 collect 恢复。
+
+### 6.4 PostgreSQL / Redis 集成测试
+
+先提供空的测试库和 Redis（下面端口仅为示例）：
+
+```bash
+docker run --name paper-agent-test-postgres -e POSTGRES_PASSWORD=paper_agent -e POSTGRES_DB=paper_agent_test -p 55432:5432 -d postgres:16
+docker run --name paper-agent-test-redis -p 56379:6379 -d redis:7
+export PAPER_AGENT_TEST_DATABASE_URL='postgresql+psycopg://postgres:paper_agent@localhost:55432/paper_agent_test'
+export PAPER_AGENT_TEST_REDIS_URL='redis://localhost:56379/0'
+uv run paper-agent db-upgrade --database-url "$PAPER_AGENT_TEST_DATABASE_URL"
+```
+
+预期：两个容器进入 running；迁移命令输出 `Database upgraded to head.`。
+
+执行 retrieve-offload-delegate 的数据库纵切：
+
+```bash
+uv run pytest tests/integration/test_postgres_metadata.py tests/integration/test_postgres_artifacts.py tests/integration/test_postgres_research_tasks.py tests/integration/test_e2e_offload_delegate.py -ra
+uv run pytest tests/integration/test_redis_compact_checkpoint.py tests/integration/test_redis_session_state.py -ra
+```
+
+预期无 skip、全部通过。PostgreSQL 组验证 0011 约束、Artifact provenance、Task/WorkUnit 幂等、真实 Offload→Hydrate 和 Delegate→Collect；Redis 组验证恢复时不重复工具调用，且不保存完整比较矩阵/Worker 正文。
+
+### 6.5 全量回归
+
+```bash
+uv run pytest -ra
+uv run mypy src
+git diff --check
+```
+
+预期：配置了 PostgreSQL/Redis 后全部测试通过且无环境型 skip；mypy 成功；`git diff --check` 无输出。未配置两个测试服务时，相关集成测试应明确显示为 skip，而不是失败。
+
+### 6.6 CLI 人工验收
+
+准备至少 6 个已经 ingest 的 paper UUID，并设置模型、数据库和 Redis：
+
+```bash
+export PAPER_AGENT_LLM_MODEL='<可用模型名>'
+export PAPER_AGENT_LLM_PROVIDER='openai'
+export PAPER_AGENT_REDIS_URL="$PAPER_AGENT_TEST_REDIS_URL"
+export PAPER_ID_1='<uuid>' PAPER_ID_2='<uuid>' PAPER_ID_3='<uuid>'
+export PAPER_ID_4='<uuid>' PAPER_ID_5='<uuid>' PAPER_ID_6='<uuid>'
+```
+
+简单请求不得 Delegate：
+
+```bash
+uv run paper-agent delegate --root "$PWD" --database-url "$PAPER_AGENT_TEST_DATABASE_URL" '比较两篇论文' --paper-id "$PAPER_ID_1" --paper-id "$PAPER_ID_2"
+```
+
+预期退出码 1，JSON 为 `delegated: false`，reason 表明 2～5 篇比较使用主 Agent + Offload。
+
+显式工作流必须完成 Delegate→Collect：
+
+```bash
+uv run paper-agent delegate --root "$PWD" --database-url "$PAPER_AGENT_TEST_DATABASE_URL" '比较方法并列出证据不足项' --paper-id "$PAPER_ID_1" --paper-id "$PAPER_ID_2" --workstream method --max-workers 2 --model "$PAPER_AGENT_LLM_MODEL" --provider "$PAPER_AGENT_LLM_PROVIDER"
+```
+
+预期退出码 0；输出同时含 `delegation` 和 `collected`；task_id 一致，status 为 `completed` 或存在可解释失败项的 `partially_completed`；每个成功 WorkUnit 只有 ArtifactReference，`unresolved_questions` 不丢失。
+
+6 篇默认批处理必须触发委派并执行验证 DAG：
+
+```bash
+uv run paper-agent delegate --root "$PWD" --database-url "$PAPER_AGENT_TEST_DATABASE_URL" '系统比较六篇论文的方法、数据集、结果与局限，并核验证据' --paper-id "$PAPER_ID_1" --paper-id "$PAPER_ID_2" --paper-id "$PAPER_ID_3" --paper-id "$PAPER_ID_4" --paper-id "$PAPER_ID_5" --paper-id "$PAPER_ID_6" --max-workers 3 --model "$PAPER_AGENT_LLM_MODEL" --provider "$PAPER_AGENT_LLM_PROVIDER"
+```
+
+预期产生确定性 WorkUnit 列表；verification 最后执行并只能读取前置 Worker Artifact；最终只汇总紧凑摘要、ArtifactReference、Citation Manifest、未解决问题和失败项。
+
+最后通过主 Agent 验收 search_artifact/read_artifact 控制面：
+
+```bash
+uv run paper-agent ask --root "$PWD" --database-url "$PAPER_AGENT_TEST_DATABASE_URL" --redis-url "$PAPER_AGENT_REDIS_URL" --model "$PAPER_AGENT_LLM_MODEL" --provider "$PAPER_AGENT_LLM_PROVIDER" '先检索刚才的研究 Artifact；如果摘要不足，选择 available_views 中的视图分页读取，然后基于 Citation Manifest 回答。'
+```
+
+预期退出码 0；Agent 能先 search_artifact，再按需 read_artifact；分页结果的 `token_count` 不超过请求上限，`next_cursor` 可继续读取，最终答案只使用返回过的引用标签。

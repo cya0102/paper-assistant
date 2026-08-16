@@ -60,6 +60,21 @@ class MemoryArtifactRepository:
                 expired += 1
         return expired
 
+    def update_status(self, project_id, artifact_id, status):
+        from dataclasses import replace
+
+        descriptor = self.items[(project_id, artifact_id)]
+        updated = replace(descriptor, status=status)
+        self.items[(project_id, artifact_id)] = updated
+        self.by_hash[
+            (
+                updated.project_id,
+                updated.artifact_type,
+                updated.schema_version,
+                updated.content_hash,
+            )
+        ] = updated
+
     def search(self, project_id, **kwargs):
         results = [
             descriptor
@@ -148,6 +163,40 @@ def test_content_hash_dedup(service: ArtifactService) -> None:
     assert second.artifact_id == first.artifact_id
 
 
+def test_same_blob_keeps_distinct_work_unit_provenance(
+    service: ArtifactService,
+) -> None:
+    project_id = uuid4()
+    first_work_unit, second_work_unit = uuid4(), uuid4()
+    first = service.materialize(
+        project_id=project_id,
+        artifact_type=ArtifactType.WORKER_RESULT,
+        schema_version="worker-v1",
+        media_type="application/json",
+        payload={"same": "bytes"},
+        summary="first",
+        session_id=uuid4(),
+        work_unit_id=first_work_unit,
+        tool_call_id="worker-1",
+    )
+    second = service.materialize(
+        project_id=project_id,
+        artifact_type=ArtifactType.WORKER_RESULT,
+        schema_version="worker-v1",
+        media_type="application/json",
+        payload={"same": "bytes"},
+        summary="second",
+        session_id=uuid4(),
+        work_unit_id=second_work_unit,
+        tool_call_id="worker-2",
+    )
+    assert first.storage_key == second.storage_key
+    assert first.artifact_id != second.artifact_id
+    assert first.work_unit_id == first_work_unit
+    assert second.work_unit_id == second_work_unit
+    assert second.summary == "second"
+
+
 def test_cross_project_read_rejected(service: ArtifactService) -> None:
     project_id = uuid4()
     descriptor = service.materialize(
@@ -203,6 +252,42 @@ def test_expired_artifact_stable_error(service: ArtifactService) -> None:
     assert excinfo.value.code == ErrorCode.ARTIFACT_EXPIRED
 
 
+def test_active_catalog_row_is_lazily_marked_expired(
+    service: ArtifactService,
+) -> None:
+    from dataclasses import replace
+
+    project_id = uuid4()
+    descriptor = service.materialize(
+        project_id=project_id,
+        artifact_type=ArtifactType.TOOL_RESULT,
+        schema_version="v1",
+        media_type="application/json",
+        payload={"x": 1},
+        summary="lazy expiry",
+    )
+    stale = replace(
+        descriptor,
+        created_at=datetime.now(UTC) - timedelta(days=2),
+        expires_at=datetime.now(UTC) - timedelta(days=1),
+        status=ArtifactStatus.ACTIVE,
+    )
+    service._repository.items[(project_id, descriptor.artifact_id)] = stale
+
+    with pytest.raises(ArtifactAccessError) as excinfo:
+        service.read_slice(
+            ArtifactSelector(
+                artifact_id=descriptor.artifact_id,
+                project_id=project_id,
+                view="default",
+            )
+        )
+
+    assert excinfo.value.code == ErrorCode.ARTIFACT_EXPIRED
+    stored = service._repository.get(project_id, descriptor.artifact_id)
+    assert stored.status == ArtifactStatus.EXPIRED
+
+
 def test_corrupt_blob_detected(service: ArtifactService, tmp_path: Path) -> None:
     project_id = uuid4()
     descriptor = service.materialize(
@@ -227,6 +312,46 @@ def test_corrupt_blob_detected(service: ArtifactService, tmp_path: Path) -> None
             )
         )
     assert excinfo.value.code == ErrorCode.ARTIFACT_CORRUPT
+    stored = service._repository.get(project_id, descriptor.artifact_id)
+    assert stored.status == ArtifactStatus.CORRUPT
+
+
+def test_idempotent_materialize_repairs_corrupt_blob(
+    service: ArtifactService, tmp_path: Path
+) -> None:
+    project_id, session_id = uuid4(), uuid4()
+    descriptor = service.materialize(
+        project_id=project_id,
+        artifact_type=ArtifactType.TOOL_RESULT,
+        schema_version="v1",
+        media_type="application/json",
+        payload={"x": 1},
+        summary="s",
+        session_id=session_id,
+        tool_call_id="call-1",
+    )
+    blob = tmp_path / ".paper-agent" / "artifacts" / "blobs" / descriptor.storage_key
+    blob.write_bytes(b"corrupt")
+    repaired = service.materialize(
+        project_id=project_id,
+        artifact_type=ArtifactType.TOOL_RESULT,
+        schema_version="v1",
+        media_type="application/json",
+        payload={"x": 1},
+        summary="s",
+        session_id=session_id,
+        tool_call_id="call-1",
+    )
+    assert repaired.artifact_id == descriptor.artifact_id
+    restored = service.read_slice(
+        ArtifactSelector(
+            artifact_id=repaired.artifact_id,
+            project_id=project_id,
+            view="full",
+            max_tokens=100,
+        )
+    )
+    assert restored.content == {"x": 1}
 
 
 def test_view_pagination(service: ArtifactService) -> None:
@@ -265,3 +390,70 @@ def test_view_pagination(service: ArtifactService) -> None:
         )
     )
     assert second.content["count"] >= 0
+
+
+def test_oversized_full_view_is_losslessly_cursor_paginated(
+    service: ArtifactService,
+) -> None:
+    project_id = uuid4()
+    payload = {"report": "中文内容" * 200}
+    descriptor = service.materialize(
+        project_id=project_id,
+        artifact_type=ArtifactType.TOOL_RESULT,
+        schema_version="v1",
+        media_type="application/json",
+        payload=payload,
+        summary="large",
+    )
+    fragments: list[str] = []
+    cursor = None
+    while True:
+        slice_ = service.read_slice(
+            ArtifactSelector(
+                artifact_id=descriptor.artifact_id,
+                project_id=project_id,
+                view="full",
+                cursor=cursor,
+                max_tokens=80,
+            )
+        )
+        assert slice_.token_count <= 80
+        fragments.append(slice_.content["json_fragment"])
+        cursor = slice_.next_cursor
+        if cursor is None:
+            break
+    import json
+
+    assert json.loads("".join(fragments)) == payload
+
+
+def test_fragment_view_only_returns_citations_visible_on_that_page(
+    service: ArtifactService,
+) -> None:
+    project_id = uuid4()
+    descriptor = service.materialize(
+        project_id=project_id,
+        artifact_type=ArtifactType.TOOL_RESULT,
+        schema_version="v1",
+        media_type="application/json",
+        payload={"prefix": "x" * 300, "citation": "E1", "suffix": "y" * 300},
+        summary="fragment citations",
+        citation_manifest=(_citation(),),
+    )
+    cursor = None
+    seen: list[str] = []
+    while True:
+        slice_ = service.read_slice(
+            ArtifactSelector(
+                artifact_id=descriptor.artifact_id,
+                project_id=project_id,
+                view="full",
+                cursor=cursor,
+                max_tokens=60,
+            )
+        )
+        seen.extend(item.citation_label for item in slice_.citations)
+        cursor = slice_.next_cursor
+        if cursor is None:
+            break
+    assert seen == ["E1"]

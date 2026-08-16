@@ -167,11 +167,12 @@ def build_agent_runtime(
     session_factory = sessionmaker(engine, class_=Session, expire_on_commit=False)
     search_service = build_search_knowledge_service(database_url=database_url)
     read_service = build_read_paper_service(database_url=database_url)
+    policy = OffloadPolicy()
     artifacts = ArtifactService(
         LocalArtifactBlobStore(project_root),
         SqlAlchemyArtifactRepository(session_factory),
+        retention_days=policy.config.artifact_retention_days,
     )
-    policy = OffloadPolicy()
     materializer = ToolResultMaterializer(artifacts, policy)
     tools = ToolRegistry()
     tools.register(SearchKnowledgeToolAdapter(search_service, project_id).contract())
@@ -181,7 +182,13 @@ def build_agent_runtime(
             build_comparison_service(database_url=database_url), project_id
         ).contract()
     )
-    tools.register(ReadArtifactToolAdapter(artifacts, project_id).contract())
+    tools.register(
+        ReadArtifactToolAdapter(
+            artifacts,
+            project_id,
+            max_tokens_cap=policy.config.read_artifact_max_tokens,
+        ).contract()
+    )
     tools.register(SearchArtifactToolAdapter(artifacts, project_id).contract())
     llm = _language_model(provider=provider, model=model)
     redis_client: Redis = Redis.from_url(redis_url, decode_responses=True)

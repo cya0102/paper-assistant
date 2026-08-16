@@ -43,10 +43,15 @@ class DelegateResearchToolAdapter:
                     "paper_ids": {
                         "type": "array",
                         "items": {"type": "string", "format": "uuid"},
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "uniqueItems": True,
                     },
                     "requested_workstreams": {
                         "type": "array",
                         "items": {"type": "string"},
+                        "maxItems": 12,
+                        "uniqueItems": True,
                     },
                     "max_workers": {"type": "integer", "minimum": 1, "maximum": 5},
                 },

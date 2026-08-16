@@ -13,8 +13,10 @@ from paper_agent.artifacts.ports import ArtifactServicePort
 from paper_agent.domain.artifact import (
     ArtifactDescriptor,
     ArtifactReference,
+    ArtifactSelector,
     CitationReference,
 )
+from paper_agent.domain.errors import PaperAgentError
 from paper_agent.research_tasks.domain import (
     ResearchTask,
     WorkUnit,
@@ -59,15 +61,18 @@ class ResultCollector:
                     )
                     for citation in descriptor.citation_manifest:
                         manifest.setdefault(citation.citation_label, citation)
+                    unresolved.extend(
+                        self._read_unresolved(task.project_id, descriptor)
+                    )
                 else:
                     summaries.append(f"{unit.work_type}: 完成")
-                unresolved.extend(unit.error.split(";") if unit.error else [])
                 continue
-            if unit.status == WorkUnitStatus.FAILED:
+            if unit.status in {WorkUnitStatus.FAILED, WorkUnitStatus.SKIPPED}:
                 failed.append(
                     {
                         "work_unit_id": str(unit.work_unit_id),
                         "work_type": unit.work_type,
+                        "status": unit.status.value,
                         "error": unit.error or "unknown error",
                     }
                 )
@@ -94,3 +99,22 @@ class ResultCollector:
             if descriptor.artifact_id == unit.output_artifact_id:
                 return descriptor
         return None
+
+    def _read_unresolved(
+        self, project_id: UUID, descriptor: ArtifactDescriptor
+    ) -> tuple[str, ...]:
+        try:
+            slice_ = self._artifacts.read_slice(
+                ArtifactSelector(
+                    artifact_id=descriptor.artifact_id,
+                    project_id=project_id,
+                    view="default",
+                    max_tokens=4000,
+                )
+            )
+        except PaperAgentError:
+            return ()
+        raw = slice_.content.get("unresolved_questions", [])
+        if not isinstance(raw, list):
+            return ()
+        return tuple(str(item) for item in raw if str(item).strip())

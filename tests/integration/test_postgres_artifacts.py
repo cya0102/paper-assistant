@@ -105,6 +105,40 @@ def test_pg_content_hash_dedup(service):
     assert first.artifact_id == second.artifact_id
 
 
+def test_pg_shared_blob_keeps_distinct_work_unit_provenance(service):
+    artifacts, project_id = service
+    payload = {"result": {"findings": ["same bytes"]}}
+    first = artifacts.materialize(
+        project_id=project_id,
+        artifact_type=ArtifactType.WORKER_RESULT,
+        schema_version="worker-result-v1",
+        media_type="application/json",
+        payload=payload,
+        summary="first worker",
+        created_by="paper_analyzer",
+        research_task_id=uuid4(),
+        work_unit_id=uuid4(),
+    )
+    second = artifacts.materialize(
+        project_id=project_id,
+        artifact_type=ArtifactType.WORKER_RESULT,
+        schema_version="worker-result-v1",
+        media_type="application/json",
+        payload=payload,
+        summary="second worker",
+        created_by="paper_analyzer",
+        research_task_id=uuid4(),
+        work_unit_id=uuid4(),
+    )
+
+    assert first.artifact_id != second.artifact_id
+    assert first.content_hash == second.content_hash
+    assert first.storage_key == second.storage_key
+    assert len(
+        artifacts.search(project_id, artifact_type=ArtifactType.WORKER_RESULT)
+    ) == 2
+
+
 def test_pg_cross_project_isolation(service):
     artifacts, project_id = service
     descriptor = artifacts.materialize(

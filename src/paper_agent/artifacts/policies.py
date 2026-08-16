@@ -23,6 +23,8 @@ class OffloadPolicyConfig:
             raise ValueError("preview_tokens must be positive")
         if self.artifact_retention_days < 1:
             raise ValueError("artifact_retention_days must be positive")
+        if not 1 <= self.read_artifact_max_tokens <= 4000:
+            raise ValueError("read_artifact_max_tokens must be between 1 and 4000")
 
 
 class OffloadPolicy:
@@ -63,7 +65,7 @@ class OffloadPolicy:
             elements = payload.get("elements", [])
             if elements or len(passages) > 4:
                 return True
-        if tool_name in {"worker_result", "delegate_research"}:
+        if tool_name == "worker_result":
             return True
         if token_count > self._config.max_inline_tokens_per_result:
             return True

@@ -36,4 +36,5 @@ class ResearchTaskRepository(Protocol):
         attempt_count: int | None = None,
         output_artifact_id: UUID | None = None,
         error: str | None = None,
+        input_artifact_ids: tuple[UUID, ...] | None = None,
     ) -> WorkUnit: ...

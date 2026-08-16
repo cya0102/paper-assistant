@@ -167,6 +167,8 @@ def task_generation_key(
     research_question: str,
     task_type: ResearchTaskType,
     plan: tuple[str, ...],
+    paper_ids: tuple[UUID, ...] = (),
+    input_artifact_ids: tuple[UUID, ...] = (),
 ) -> str:
     payload = json.dumps(
         [
@@ -175,6 +177,8 @@ def task_generation_key(
             research_question,
             task_type.value,
             list(plan),
+            sorted(str(value) for value in paper_ids),
+            sorted(str(value) for value in input_artifact_ids),
         ],
         ensure_ascii=False,
         sort_keys=True,
@@ -191,6 +195,7 @@ def work_unit_generation_key(
     input_artifact_ids: tuple[UUID, ...],
     requested_worker: str,
     output_schema: dict[str, Any] | None,
+    dependency_ids: tuple[UUID, ...] = (),
 ) -> str:
     payload = json.dumps(
         [
@@ -201,6 +206,7 @@ def work_unit_generation_key(
             [str(value) for value in input_artifact_ids],
             requested_worker,
             output_schema,
+            [str(value) for value in dependency_ids],
         ],
         ensure_ascii=False,
         sort_keys=True,

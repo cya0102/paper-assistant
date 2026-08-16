@@ -43,7 +43,14 @@ class LocalArtifactBlobStore:
         key = f"sha256/{content_hash[:2]}/{content_hash}.json.gz"
         target = self._blob_root / key
         if target.is_file():
-            return key  # idempotent content-addressed put
+            try:
+                existing = gzip.decompress(target.read_bytes())
+            except (OSError, EOFError):
+                existing = b""
+            if sha256(existing).hexdigest() == content_hash:
+                return key  # idempotent, verified content-addressed put
+            # A corrupt blob at the correct content address is repaired by the
+            # same atomic replacement path used for a first write.
         compressed = gzip.compress(data, compresslevel=6, mtime=0)
         target.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=".tmp-", suffix=".gz")

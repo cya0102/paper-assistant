@@ -129,6 +129,23 @@ def test_work_unit_generation_key_dedup(repo):
     assert units[0].work_unit_id == unit.work_unit_id
 
 
+def test_task_generation_key_dedup_survives_distinct_task_ids(repo):
+    repository, project_id = repo
+    user_id = uuid4()
+    first_input = _task(project_id, user_id)
+    second_input = _task(project_id, user_id)
+    assert first_input.task_id != second_input.task_id
+    assert first_input.generation_key == second_input.generation_key
+
+    first = repository.save_task(first_input)
+    second = repository.save_task(second_input)
+
+    assert second.task_id == first.task_id
+    assert repository.find_task_by_generation_key(
+        project_id, first.generation_key
+    ) == first
+
+
 def test_cross_project_task_not_found(repo):
     repository, project_id = repo
     task = repository.save_task(_task(project_id, uuid4()))
