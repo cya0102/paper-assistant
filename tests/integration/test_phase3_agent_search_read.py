@@ -40,7 +40,6 @@ class ToolCallingModel:
         assert {item["name"] for item in tools} == {
             "search_knowledge",
             "read_paper",
-            "compare_papers",
         }
         return ModelTurn(
             "response-search-read",
@@ -97,7 +96,16 @@ def test_phase3_agent_search_read_and_memory_round_trip():
         assert len(answer.tool_results[0].payload["evidence"]) >= 1
         assert len(answer.tool_results[1].payload["passages"]) == 2
         assert all(item["citation"].startswith("P") for item in answer.tool_results[1].payload["passages"])
-        assert len(answer.tool_results[1].payload["evidence"]) == 2
+        # read_paper no longer emits a duplicated unified evidence list; the
+        # citations ride on the passages/elements themselves.
+        assert "evidence" not in answer.tool_results[1].payload
+        assert all(
+            item.get("citation")
+            for item in (
+                *answer.tool_results[1].payload["passages"],
+                *answer.tool_results[1].payload["elements"],
+            )
+        )
         with pytest.raises(LookupError, match="not found in project"):
             ReadPaperService(SqlAlchemyPaperReadRepository(factory)).read_paper(
                 ReadPaperRequest(paper_id=paper_id, project_id=uuid4())

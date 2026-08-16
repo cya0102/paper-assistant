@@ -1,0 +1,182 @@
+import json
+from uuid import uuid4
+
+import pytest
+
+from paper_agent.agent.context_builder import ToolEvidenceCitationFormatter
+from paper_agent.agent.runtime import AgentRuntime
+from paper_agent.agent.tools import ToolContract, ToolRegistry
+from paper_agent.artifacts.materializer import ToolResultMaterializer
+from paper_agent.artifacts.policies import OffloadPolicy, OffloadPolicyConfig
+from paper_agent.artifacts.service import ArtifactService
+from paper_agent.artifacts.tokens import count_tokens
+from paper_agent.domain.agent import AgentRunStatus, ModelTurn, ToolCall
+from paper_agent.memory import InMemoryCheckpointStore, InMemorySessionStore
+from paper_agent.storage.local.artifact_blob_store import LocalArtifactBlobStore
+from tests.unit.artifacts.test_artifact_service import MemoryArtifactRepository
+
+
+class RecordingModel:
+    def __init__(self, big_payload: dict):
+        self.big_payload = big_payload
+        self.received_results = []
+
+    def start(self, checkpoint, tools):
+        return ModelTurn(
+            response_id="response-1",
+            tool_calls=(ToolCall("call-1", "search_knowledge", {"query": "x"}),),
+        )
+
+    def continue_with_tools(self, checkpoint, results, tools):
+        self.received_results = list(results)
+        return ModelTurn(response_id="response-2", output_text="答案来自证据。[E0]")
+
+
+def _tool(big_payload: dict):
+    return ToolContract(
+        name="search_knowledge",
+        description="search",
+        parameters={"type": "object"},
+        handler=lambda arguments: big_payload,
+    )
+
+
+def _big_payload() -> dict:
+    paper_id = uuid4()
+    return {
+        "query": "q",
+        "status": "ok",
+        "has_sufficient_evidence": True,
+        "summary": "big",
+        "resolved_papers": [
+            {"paper_id": str(paper_id), "version_id": str(uuid4()), "title": "P", "score": 1.0}
+        ],
+        "evidence": [
+            {
+                "citation": f"E{i}",
+                "evidence_id": str(uuid4()),
+                "chunk_id": str(uuid4()),
+                "paper_id": str(paper_id),
+                "version_id": str(uuid4()),
+                "paper_title": "Paper",
+                "section_id": str(uuid4()),
+                "section_path": "Method",
+                "page_start": 1,
+                "page_end": 2,
+                "text": "evidence " + "word " * 40,
+                "relevance": 0.9,
+            }
+            for i in range(8)
+        ],
+    }
+
+
+def _build(tmp_path, big_payload: dict) -> tuple[AgentRuntime, RecordingModel]:
+    service = ArtifactService(
+        LocalArtifactBlobStore(tmp_path),
+        MemoryArtifactRepository(),
+    )
+    policy = OffloadPolicy(
+        OffloadPolicyConfig(max_inline_tokens_per_result=200, preview_tokens=60)
+    )
+    materializer = ToolResultMaterializer(service, policy)
+    registry = ToolRegistry()
+    registry.register(_tool(big_payload))
+    model = RecordingModel(big_payload)
+    runtime = AgentRuntime(
+        model,
+        registry,
+        InMemoryCheckpointStore(),
+        answer_finalizer=ToolEvidenceCitationFormatter(),
+        sessions=InMemorySessionStore(),
+        materializer=materializer,
+    )
+    return runtime, model
+
+
+def test_runtime_offloads_large_result_and_sends_compact_payload(
+    tmp_path,
+) -> None:
+    runtime, model = _build(tmp_path, _big_payload())
+    session_id = uuid4()
+    answer = runtime.run(
+        session_id=session_id,
+        user_id=uuid4(),
+        project_id=uuid4(),
+        query="question",
+    )
+    # The provider only ever receives the compact model payload
+    assert len(model.received_results) == 1
+    compact = model.received_results[0]
+    assert compact.artifact_ref is not None
+    assert compact.model_payload["omitted_evidence"] > 0
+    # No full raw payload in the checkpoint
+    assert all(
+        count_tokens(json.dumps(item.model_payload, ensure_ascii=False)) < 2000
+        for item in answer.tool_results
+    )
+    # The answer still carries the citation sources
+    assert "[E0]" in answer.text and "来源：" in answer.text
+
+
+def test_runtime_resume_does_not_repeat_offloaded_tool_call(tmp_path) -> None:
+    runtime, model = _build(tmp_path, _big_payload())
+    session_id, user_id, project_id = uuid4(), uuid4(), uuid4()
+    store = runtime._checkpoints
+
+    # Simulate a checkpoint that already completed call-1 and is waiting for call-2
+    from paper_agent.domain.agent import AgentCheckpoint, ToolResult
+
+    store.save(
+        AgentCheckpoint(
+            session_id=session_id,
+            user_id=user_id,
+            project_id=project_id,
+            messages=[],
+            status=AgentRunStatus.WAITING_FOR_TOOLS,
+            response_id="response-1",
+            pending_calls=[ToolCall("call-2", "search_knowledge", {"query": "more"})],
+            pending_response_results=[],
+            tool_results=[
+                ToolResult(
+                    call_id="call-1",
+                    name="search_knowledge",
+                    model_payload={"status": "ok"},
+                )
+            ],
+        )
+    )
+    # the tool handler is only called for call-2
+    calls = []
+
+    def handler(arguments):
+        calls.append(arguments)
+        return {"query": "more", "status": "ok", "summary": "s", "evidence": []}
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolContract(
+            name="search_knowledge",
+            description="search",
+            parameters={"type": "object"},
+            handler=handler,
+        )
+    )
+    service = ArtifactService(
+        LocalArtifactBlobStore(tmp_path),
+        MemoryArtifactRepository(),
+    )
+    runtime2 = AgentRuntime(
+        model,
+        registry,
+        store,
+        materializer=ToolResultMaterializer(
+            service,
+            OffloadPolicy(OffloadPolicyConfig(max_inline_tokens_per_result=200)),
+        ),
+    )
+    answer = runtime2.run(
+        session_id=session_id, user_id=user_id, project_id=project_id, query="ignored"
+    )
+    assert calls == [{"query": "more"}]
+    assert {item.call_id for item in answer.tool_results} == {"call-1", "call-2"}

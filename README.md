@@ -54,6 +54,20 @@ The technical source of truth is `paper-agent-technical-spec.md`.
 - Agent `compare_papers` Tool and offline `profile-extract` / `compare` CLI commands.
 - Derived structure state bound to the exact canonical Parsed Document hash.
 - Section-bound Notes survive structure replacement through `ON DELETE SET NULL`.
+- Content-addressed Artifact Store (SHA-256 blobs + gzip + atomic rename) under
+  `.paper-agent/artifacts/` with a project-scoped PostgreSQL catalog.
+- `ToolResult` refactor: checkpoints/Redis/Providers only ever see a compact
+  `model_payload`, an `artifact_ref`, and a `citation_manifest`; full raw
+  payloads are offloaded to the Artifact Store by `OffloadPolicy`.
+- `read_artifact` / `search_artifact` Tools with bounded views, cursors, and
+  token budgets; cross-project/expired/corrupt reads fail with stable errors.
+- `compare_papers` / `read_paper` / `search_knowledge` compact model views with
+  full results recoverable through Artifact hydration.
+- ResearchTask / WorkUnit persistence (`research_tasks`, `work_units`) with
+  stable generation keys for idempotent retries.
+- Bounded single-layer delegation: `delegate_research` / `collect_research_task`
+  Tools, `paper_analyzer` and `evidence_verifier` workers, and a synchronous
+  dependency-aware Scheduler with one automatic retry.
 
 The default ingestion/search path remains offline. Model API credentials are only
 required for `ask` or when explicitly selecting an online Embedding provider.
@@ -152,7 +166,21 @@ Every non-empty comparison cell carries EvidenceLink records back to the exact
 PaperVersion, Section, Chunk, page range, source blocks, and evidence text. Missing
 Profile/Claim evidence produces an explicit refusal cell rather than generated text.
 
+## Retrieve + Offload + Delegate
+
+Full tool results (comparison matrices, full-section reads, complete search
+candidates, worker outputs) are written to a content-addressed Artifact Store
+instead of the model context. The Agent receives a compact payload, an
+`artifact_ref`, and a citation manifest; it hydrates details on demand with
+`read_artifact`. Complex research questions can be delegated to isolated
+workers (`delegate_research` -> `collect_research_task`) that only ever see a
+task brief and return schema-valid artifacts.
+
+See [`docs/retrieve-offload-delegate.md`](docs/retrieve-offload-delegate.md) for the
+full design and CLI usage.
+
 The full staged plan is in
 [`docs/research-graph-roadmap.md`](docs/research-graph-roadmap.md). The delivered
-vertical slice is summarized in
-[`docs/Phase4阶段总结.md`](docs/Phase4阶段总结.md).
+vertical slices are summarized in
+[`docs/Phase4阶段总结.md`](docs/Phase4阶段总结.md) and
+[`docs/retrieve-offload-delegate.md`](docs/retrieve-offload-delegate.md).

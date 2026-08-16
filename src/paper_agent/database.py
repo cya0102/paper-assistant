@@ -33,6 +33,10 @@ def upgrade_database(database_url: str) -> None:
     config = Config(str(project_root / "alembic.ini"))
     config.set_main_option("script_location", str(project_root / "migrations"))
     config.set_main_option("sqlalchemy.url", database_url)
+    # Mark the URL as an explicit programmatic override.  migrations/env.py
+    # otherwise reads PAPER_AGENT_DATABASE_URL, which can accidentally route a
+    # test migration to the application database.
+    config.attributes["database_url_override"] = database_url
     command.upgrade(config, "head")
 
 

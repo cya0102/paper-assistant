@@ -240,8 +240,9 @@ class MimoResponsesModel:
     def _evidence_citations(results: tuple[ToolResult, ...]) -> tuple[str, ...]:
         citations: list[str] = []
         for result in results:
-            for key in ("evidence", "passages", "elements"):
-                for raw in result.payload.get(key, []):
+            keys = ("selected_evidence", "evidence", "passages", "elements")
+            for key in keys:
+                for raw in result.model_payload.get(key, []):
                     if not isinstance(raw, dict):
                         continue
                     citation = raw.get("citation")
@@ -276,14 +277,15 @@ class MimoResponsesModel:
         # budgeted pack. The seen set deduplicates entries that appear both in
         # the unified "evidence" list and in the legacy "passages"/"elements".
         for result in results:
-            for key in ("evidence", "passages", "elements"):
-                for raw in result.payload.get(key, []):
+            keys = ("selected_evidence", "evidence", "passages", "elements")
+            for key in keys:
+                for raw in result.model_payload.get(key, []):
                     if not isinstance(raw, dict):
                         continue
                     citation = raw.get("citation")
                     if not isinstance(citation, str) or not citation or citation in seen:
                         continue
-                    paper_title = raw.get("paper_title") or result.payload.get("title")
+                    paper_title = raw.get("paper_title") or result.model_payload.get("title")
                     header = (
                         f"[{citation}] {paper_title} | "
                         f"{raw.get('section_path')} | "

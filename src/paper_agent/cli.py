@@ -8,14 +8,20 @@ from typing import NoReturn
 from uuid import UUID, uuid4
 
 from paper_agent.application import (
+    _language_model,
     build_agent_runtime,
+    build_artifact_service,
     build_comparison_service,
     build_ingestion_pipeline,
     build_read_paper_service,
     build_research_graph_service,
+    build_research_task_service,
     build_search_knowledge_service,
 )
+from paper_agent.artifacts.materializer import ToolResultMaterializer
+from paper_agent.artifacts.policies import OffloadPolicy
 from paper_agent.agent.tool_adapters import ComparePapersToolAdapter
+from paper_agent.research_tasks.service import DelegationRefusedError
 from paper_agent.database import database_status, upgrade_database
 from paper_agent.domain.ingestion import IngestionRequest
 from paper_agent.domain.enums import ElementType
@@ -48,6 +54,8 @@ def main(argv: list[str] | None = None) -> int:
             upgrade_database(_database_url(args.database_url))
             print("Database upgraded to head.")
             return 0
+        if args.command == "delegate":
+            return _delegate(args)
     except Exception as error:
         _fail(str(error))
     parser.print_help()
@@ -107,7 +115,84 @@ def _build_parser() -> argparse.ArgumentParser:
     compare.add_argument("paper_ids", nargs="+", type=UUID)
     upgrade = subparsers.add_parser("db-upgrade", help="Apply all database migrations")
     _database_argument(upgrade)
+    delegate = subparsers.add_parser(
+        "delegate", help="Run a bounded research delegation synchronously"
+    )
+    _root_argument(delegate)
+    _database_argument(delegate)
+    delegate.add_argument("objective")
+    delegate.add_argument("--paper-id", action="append", type=UUID, dest="paper_ids")
+    delegate.add_argument(
+        "--workstream", action="append", dest="workstreams"
+    )
+    delegate.add_argument("--max-workers", type=int, default=3)
+    delegate.add_argument("--user-id", type=UUID)
+    delegate.add_argument("--session-id", type=UUID)
+    delegate.add_argument("--redis-url")
+    delegate.add_argument("--model")
+    delegate.add_argument("--provider", choices=("openai", "mimo"))
     return parser
+
+
+def _delegate(args: argparse.Namespace) -> int:
+    """Run a bounded, synchronous research delegation through the WorkerRunner."""
+    from paper_agent.application import build_research_task_service
+
+    manifest = ProjectManifestStore(args.root.resolve()).load()
+    redis_url = args.redis_url or os.environ.get(
+        "PAPER_AGENT_REDIS_URL", "redis://localhost:6379/0"
+    )
+    model = (
+        args.model
+        or os.environ.get("PAPER_AGENT_LLM_MODEL")
+        or os.environ.get("OPENAI_CHAT_MODEL")
+    )
+    if not model:
+        raise ValueError("Set PAPER_AGENT_LLM_MODEL or pass --model")
+    provider = (
+        args.provider
+        or os.environ.get("PAPER_AGENT_LLM_PROVIDER")
+        or ("mimo" if model.lower().startswith("mimo-") else "openai")
+    )
+    paper_ids = tuple(args.paper_ids or ())
+    if not paper_ids:
+        raise ValueError("delegate requires at least one --paper-id")
+    user_id = args.user_id or uuid4()
+    session_id = args.session_id or uuid4()
+    llm = _language_model(provider=provider, model=model)
+    database_url = _database_url(args.database_url)
+    artifacts = build_artifact_service(
+        database_url=database_url, project_root=args.root.resolve()
+    )
+    service = build_research_task_service(
+        database_url=database_url,
+        project_root=args.root.resolve(),
+        redis_url=redis_url,
+        model=llm,
+        search_service=build_search_knowledge_service(database_url=database_url),
+        read_service=build_read_paper_service(database_url=database_url),
+        artifacts=artifacts,
+        materializer=ToolResultMaterializer(artifacts, OffloadPolicy()),
+    )
+    try:
+        summary = service.delegate(
+            project_id=manifest.project_id,
+            user_id=user_id,
+            session_id=session_id,
+            objective=args.objective,
+            paper_ids=paper_ids,
+            requested_workstreams=tuple(args.workstreams or ()),
+            max_workers=args.max_workers,
+        )
+    except DelegationRefusedError as error:
+        print(json.dumps({"delegated": False, "reason": str(error)}, ensure_ascii=False, indent=2))
+        return 1
+    collected = service.collect(
+        project_id=manifest.project_id,
+        task_id=UUID(summary["task_id"]),
+    )
+    print(json.dumps({"delegation": summary, "collected": collected}, ensure_ascii=False, indent=2))
+    return 0
 
 
 def _root_argument(parser: argparse.ArgumentParser) -> None:
@@ -283,6 +368,9 @@ def _ask(args: argparse.Namespace) -> int:
         redis_url=redis_url,
         model=model,
         provider=provider,
+        project_root=args.root.resolve(),
+        user_id=user_id,
+        session_id=session_id,
     ).run(
         session_id=session_id,
         user_id=user_id,

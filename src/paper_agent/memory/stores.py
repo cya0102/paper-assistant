@@ -13,6 +13,12 @@ from paper_agent.domain.agent import (
     ToolCall,
     ToolResult,
 )
+from paper_agent.domain.artifact import (
+    artifact_ref_from_dict,
+    artifact_ref_to_dict,
+    citation_from_dict,
+    citation_to_dict,
+)
 from paper_agent.domain.memory import SessionState
 
 
@@ -41,6 +47,30 @@ class InMemorySessionStore:
         self.items[state.session_id] = state
 
 
+def _tool_result_to_dict(result: ToolResult) -> dict[str, Any]:
+    return {
+        "call_id": result.call_id,
+        "name": result.name,
+        "model_payload": result.model_payload,
+        "artifact_ref": artifact_ref_to_dict(result.artifact_ref),
+        "citation_manifest": [citation_to_dict(item) for item in result.citation_manifest],
+        "is_error": result.is_error,
+    }
+
+
+def _tool_result_from_dict(raw: dict[str, Any]) -> ToolResult:
+    return ToolResult(
+        call_id=str(raw["call_id"]),
+        name=str(raw["name"]),
+        model_payload=dict(raw.get("model_payload", {})),
+        artifact_ref=artifact_ref_from_dict(raw.get("artifact_ref")),
+        citation_manifest=tuple(
+            citation_from_dict(item) for item in raw.get("citation_manifest", [])
+        ),
+        is_error=bool(raw.get("is_error", False)),
+    )
+
+
 class RedisCheckpointStore:
     def __init__(self, client: Redis, *, ttl_seconds: int = 86_400, prefix: str = "paper-agent") -> None:
         self._client = client
@@ -61,9 +91,9 @@ class RedisCheckpointStore:
             response_id=raw["response_id"],
             pending_calls=[ToolCall(**item) for item in raw["pending_calls"]],
             pending_response_results=[
-                ToolResult(**item) for item in raw.get("pending_response_results", [])
+                _tool_result_from_dict(item) for item in raw.get("pending_response_results", [])
             ],
-            tool_results=[ToolResult(**item) for item in raw["tool_results"]],
+            tool_results=[_tool_result_from_dict(item) for item in raw["tool_results"]],
             model_history=list(raw.get("model_history", [])),
             step=int(raw["step"]),
             error=raw["error"],
@@ -82,13 +112,9 @@ class RedisCheckpointStore:
                 for item in checkpoint.pending_calls
             ],
             "pending_response_results": [
-                {"call_id": item.call_id, "name": item.name, "payload": item.payload, "is_error": item.is_error}
-                for item in checkpoint.pending_response_results
+                _tool_result_to_dict(item) for item in checkpoint.pending_response_results
             ],
-            "tool_results": [
-                {"call_id": item.call_id, "name": item.name, "payload": item.payload, "is_error": item.is_error}
-                for item in checkpoint.tool_results
-            ],
+            "tool_results": [_tool_result_to_dict(item) for item in checkpoint.tool_results],
             "model_history": checkpoint.model_history,
             "step": checkpoint.step,
             "error": checkpoint.error,

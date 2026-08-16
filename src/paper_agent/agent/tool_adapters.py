@@ -20,10 +20,20 @@ class SearchKnowledgeToolAdapter:
         service: KnowledgeSearch,
         project_id: UUID,
         context_builder: ContextBuilder | None = None,
+        *,
+        paper_scope: tuple[UUID, ...] | None = None,
     ) -> None:
         self._service = service
         self._project_id = project_id
         self._context_builder = context_builder or ContextBuilder()
+        self._paper_scope = paper_scope
+
+    def _resolve_paper_ids(self, arguments: dict[str, Any]) -> tuple[UUID, ...]:
+        requested = tuple(UUID(value) for value in arguments.get("paper_ids", []))
+        if self._paper_scope is None:
+            return requested
+        allowed = set(self._paper_scope)
+        return tuple(dict.fromkeys(value for value in requested if value in allowed))
 
     def contract(self) -> ToolContract:
         return ToolContract(
@@ -51,7 +61,7 @@ class SearchKnowledgeToolAdapter:
                 query=str(arguments["query"]),
                 scope=SearchScope(
                     project_id=self._project_id,
-                    paper_ids=tuple(UUID(value) for value in arguments.get("paper_ids", [])),
+                    paper_ids=self._resolve_paper_ids(arguments),
                     section_ids=tuple(UUID(value) for value in arguments.get("section_ids", [])),
                 ),
                 filters=MetadataFilter(
@@ -60,16 +70,33 @@ class SearchKnowledgeToolAdapter:
                 max_evidence=int(arguments.get("max_evidence", 5)),
             )
         )
-        context = self._context_builder.build(result.query, result.evidence)
-        selected = tuple(item.evidence for item in context.citations)
+        evidence = [
+            {
+                "citation": f"E{int(item.evidence_id.hex[:12], 16)}",
+                "evidence_id": str(item.evidence_id),
+                "chunk_id": str(item.chunk_id),
+                "paper_id": str(item.paper_id),
+                "version_id": str(item.version_id),
+                "paper_title": item.paper_title,
+                "section_id": str(item.section_id),
+                "section_path": item.section_path,
+                "page_start": item.page_start,
+                "page_end": item.page_end,
+                "element_ids": [str(value) for value in item.element_ids],
+                "text": item.text,
+                "relevance": item.relevance,
+            }
+            for item in result.evidence
+        ]
         return {
             "query": result.query,
             "status": result.status.value,
             "has_sufficient_evidence": result.has_sufficient_evidence,
             "reason": result.reason,
-            "context": context.text,
-            "context_token_count": context.token_count,
-            "omitted_evidence": context.omitted_evidence,
+            "summary": (
+                f"找到 {len(result.evidence)} 条证据，覆盖 "
+                f"{len(result.resolved_papers)} 篇论文"
+            ),
             "resolved_papers": [
                 {
                     "paper_id": str(item.paper_id),
@@ -79,31 +106,21 @@ class SearchKnowledgeToolAdapter:
                 }
                 for item in result.resolved_papers
             ],
-            "evidence": [
-                {
-                    "citation": f"E{int(item.evidence_id.hex[:12], 16)}",
-                    "evidence_id": str(item.evidence_id),
-                    "chunk_id": str(item.chunk_id),
-                    "paper_id": str(item.paper_id),
-                    "version_id": str(item.version_id),
-                    "paper_title": item.paper_title,
-                    "section_id": str(item.section_id),
-                    "section_path": item.section_path,
-                    "page_start": item.page_start,
-                    "page_end": item.page_end,
-                    "element_ids": [str(value) for value in item.element_ids],
-                    "text": item.text,
-                    "relevance": item.relevance,
-                }
-                for item in selected
-            ],
+            "evidence": evidence,
         }
 
 
 class ReadPaperToolAdapter:
-    def __init__(self, service: ReadPaperService, project_id: UUID) -> None:
+    def __init__(
+        self,
+        service: ReadPaperService,
+        project_id: UUID,
+        *,
+        paper_scope: tuple[UUID, ...] | None = None,
+    ) -> None:
         self._service = service
         self._project_id = project_id
+        self._paper_scope = paper_scope
 
     def contract(self) -> ToolContract:
         return ToolContract(
@@ -129,9 +146,12 @@ class ReadPaperToolAdapter:
 
     def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
         page_range = arguments.get("page_range")
+        paper_id = UUID(arguments["paper_id"])
+        if self._paper_scope is not None and paper_id not in self._paper_scope:
+            return {"error": "paper_not_in_worker_scope", "message": "Paper is outside this worker's assigned scope"}
         result = self._service.read_paper(
             ReadPaperRequest(
-                paper_id=UUID(arguments["paper_id"]),
+                paper_id=paper_id,
                 project_id=self._project_id,
                 version_id=self._optional_uuid(arguments.get("version_id")),
                 section_id=self._optional_uuid(arguments.get("section_id")),
@@ -183,33 +203,15 @@ class ReadPaperToolAdapter:
             }
             for item in result.elements
         ]
-        # Unified evidence so the Finalizer, MiMo synthesis, Runtime Memory and
-        # any other consumer can treat Read results exactly like Search results.
-        evidence = [
-            {
-                "citation": entry["citation"],
-                "paper_id": str(result.paper_id),
-                "version_id": str(result.version_id),
-                "paper_title": entry["paper_title"],
-                "section_id": entry["section_id"],
-                "section_path": entry["section_path"],
-                "page_start": entry["page_start"],
-                "page_end": entry["page_end"],
-                "chunk_id": entry.get("chunk_id"),
-                "element_id": entry.get("element_id"),
-                "text": entry["text"]
-                if "text" in entry
-                else entry.get("content") or entry.get("caption") or entry.get("label") or "",
-            }
-            for entry in (*passages, *elements)
-        ]
+        # No unified "evidence" list is emitted: passages/elements carry the
+        # citation labels and the ToolResultMaterializer builds the Citation
+        # Manifest from them, so the same text is never duplicated in one payload.
         return {
             "paper_id": str(result.paper_id),
             "version_id": str(result.version_id),
             "title": result.title,
             "passages": passages,
             "elements": elements,
-            "evidence": evidence,
         }
 
 
@@ -253,6 +255,7 @@ class ComparePapersToolAdapter:
         payload: dict[str, Any] = {
             "project_id": str(result.project_id),
             "paper_ids": [str(value) for value in result.paper_ids],
+            "paper_count": len(result.paper_ids),
             "status": result.status.value,
             "reason": result.reason,
             "derivation": {

@@ -1,10 +1,13 @@
 """Checkpointed, idempotent model/tool loop."""
 
+import json
 from collections.abc import Callable
 from uuid import UUID
 
 from paper_agent.agent.ports import AgentCheckpointStore, LanguageModel, MemoryRepository, SessionStore
 from paper_agent.agent.tools import ToolRegistry
+from paper_agent.artifacts.materializer import ToolResultMaterializer
+from paper_agent.artifacts.tokens import count_tokens
 from paper_agent.domain.agent import (
     AgentAnswer,
     AgentCheckpoint,
@@ -27,6 +30,7 @@ class AgentRuntime:
         answer_finalizer: Callable[[str, tuple[ToolResult, ...]], str] | None = None,
         sessions: SessionStore | None = None,
         memory: MemoryRepository | None = None,
+        materializer: ToolResultMaterializer | None = None,
     ) -> None:
         self._model = model
         self._tools = tools
@@ -35,6 +39,7 @@ class AgentRuntime:
         self._answer_finalizer = answer_finalizer
         self._sessions = sessions
         self._memory = memory
+        self._materializer = materializer
 
     def run(
         self,
@@ -119,13 +124,30 @@ class AgentRuntime:
                 if call.call_id in completed_call_ids:
                     continue
                 try:
-                    payload = self._tools.execute(call.name, call.arguments)
-                    result = ToolResult(call_id=call.call_id, name=call.name, payload=payload)
+                    raw_payload = self._tools.execute(call.name, call.arguments)
+                    if self._materializer is not None:
+                        accumulated = sum(
+                            count_tokens(json.dumps(item.model_payload, ensure_ascii=False))
+                            for item in checkpoint.tool_results
+                        )
+                        result = self._materializer.materialize(
+                            project_id=checkpoint.project_id,
+                            session_id=checkpoint.session_id,
+                            call=call,
+                            raw_payload=raw_payload,
+                            accumulated_tokens=accumulated,
+                        )
+                    else:
+                        result = ToolResult(
+                            call_id=call.call_id,
+                            name=call.name,
+                            model_payload=raw_payload,
+                        )
                 except Exception as error:
                     result = ToolResult(
                         call_id=call.call_id,
                         name=call.name,
-                        payload={"error": str(error)},
+                        model_payload={"error": str(error)},
                         is_error=True,
                     )
                 checkpoint.tool_results.append(result)
@@ -145,7 +167,13 @@ class AgentRuntime:
         paper_ids: list[UUID] = []
         chunk_ids: list[UUID] = []
         for result in checkpoint.tool_results:
-            for raw in result.payload.get("evidence", []):
+            if result.citation_manifest:
+                for citation in result.citation_manifest:
+                    paper_ids.append(citation.paper_id)
+                    if citation.chunk_id is not None:
+                        chunk_ids.append(citation.chunk_id)
+                continue
+            for raw in result.model_payload.get("evidence", []):
                 if not isinstance(raw, dict):
                     continue
                 if raw.get("paper_id"):
@@ -179,7 +207,7 @@ class AgentRuntime:
                 [{"role": "user", "content": query}, {"role": "assistant", "content": answer}]
             )
             state.active_chunk_ids = list(unique_chunks)
-            state.last_tool_results = [item.payload for item in checkpoint.tool_results[-5:]]
+            state.last_tool_results = [item.model_payload for item in checkpoint.tool_results[-5:]]
             if unique_papers:
                 state.current_paper_id = unique_papers[0]
             self._sessions.save(state)

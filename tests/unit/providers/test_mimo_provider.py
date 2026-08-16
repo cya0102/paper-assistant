@@ -66,7 +66,7 @@ def test_mimo_replays_history_without_previous_response_id_and_hides_tools_for_f
     result = ToolResult(
         call_id=first.tool_calls[0].call_id,
         name="search_knowledge",
-        payload={
+        model_payload={
             "has_sufficient_evidence": True,
             "evidence": [{"citation": "E1", "text": "evidence"}],
         },

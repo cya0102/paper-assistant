@@ -926,3 +926,170 @@ class IngestionItemRow(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
+
+
+class ResearchArtifactRow(Base):
+    """Catalog row for one stored, content-addressed Artifact."""
+
+    __tablename__ = "research_artifacts"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "artifact_type",
+            "schema_version",
+            "content_hash",
+            name="uq_research_artifacts_project_type_schema_hash",
+        ),
+        Index("ix_research_artifacts_project_artifact", "project_id", "artifact_id"),
+        Index("ix_research_artifacts_created_by", "created_by"),
+        Index("ix_research_artifacts_task", "research_task_id"),
+        Index("ix_research_artifacts_work_unit", "work_unit_id"),
+        CheckConstraint(
+            "content_hash ~ '^[0-9a-f]{64}$'", name="ck_research_artifacts_content_hash_sha256"
+        ),
+        CheckConstraint(
+            "byte_size >= 0", name="ck_research_artifacts_byte_size_nonnegative"
+        ),
+        CheckConstraint(
+            "token_estimate >= 0", name="ck_research_artifacts_token_estimate_nonnegative"
+        ),
+    )
+
+    artifact_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False
+    )
+    session_id: Mapped[UUID | None] = mapped_column(PostgresUUID(as_uuid=True))
+    research_task_id: Mapped[UUID | None] = mapped_column(PostgresUUID(as_uuid=True))
+    work_unit_id: Mapped[UUID | None] = mapped_column(PostgresUUID(as_uuid=True))
+    tool_call_id: Mapped[str | None] = mapped_column(String(255))
+    artifact_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    storage_backend: Mapped[str] = mapped_column(String(64), nullable=False)
+    storage_key: Mapped[str] = mapped_column(Text, nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    token_estimate: Mapped[int] = mapped_column(Integer, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ArtifactCitationRow(Base):
+    """Persisted Citation Manifest entries for an Artifact."""
+
+    __tablename__ = "artifact_citations"
+    __table_args__ = (
+        UniqueConstraint(
+            "artifact_id",
+            "citation_label",
+            name="uq_artifact_citations_artifact_label",
+        ),
+        Index("ix_artifact_citations_project_artifact", "project_id", "artifact_id"),
+        Index("ix_artifact_citations_label", "citation_label"),
+        Index("ix_artifact_citations_paper_version", "project_id", "paper_id", "version_id"),
+    )
+
+    citation_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid4)
+    artifact_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True), ForeignKey("research_artifacts.artifact_id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False
+    )
+    citation_label: Mapped[str] = mapped_column(String(64), nullable=False)
+    paper_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    version_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    paper_title: Mapped[str] = mapped_column(Text, nullable=False)
+    section_path: Mapped[str] = mapped_column(Text, nullable=False)
+    section_id: Mapped[UUID | None] = mapped_column(PostgresUUID(as_uuid=True))
+    chunk_id: Mapped[UUID | None] = mapped_column(PostgresUUID(as_uuid=True))
+    element_id: Mapped[UUID | None] = mapped_column(PostgresUUID(as_uuid=True))
+    page_start: Mapped[int | None] = mapped_column(Integer)
+    page_end: Mapped[int | None] = mapped_column(Integer)
+    evidence_hash: Mapped[str | None] = mapped_column(String(64))
+
+
+class ResearchTaskRow(Base):
+    __tablename__ = "research_tasks"
+    __table_args__ = (
+        Index("ix_research_tasks_project_status", "project_id", "status"),
+        Index("ix_research_tasks_session", "session_id"),
+    )
+
+    task_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    session_id: Mapped[UUID | None] = mapped_column(PostgresUUID(as_uuid=True))
+    research_question: Mapped[str] = mapped_column(Text, nullable=False)
+    task_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    plan_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    max_workers: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    generation_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class WorkUnitRow(Base):
+    __tablename__ = "work_units"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id", "generation_key", name="uq_work_units_task_generation_key"
+        ),
+        Index("ix_work_units_task_status", "task_id", "status"),
+        Index("ix_work_units_requested_worker", "requested_worker"),
+        CheckConstraint(
+            "token_budget > 0", name="ck_work_units_token_budget_positive"
+        ),
+        CheckConstraint(
+            "tool_call_budget > 0", name="ck_work_units_tool_call_budget_positive"
+        ),
+        CheckConstraint(
+            "timeout_seconds > 0", name="ck_work_units_timeout_positive"
+        ),
+        CheckConstraint(
+            "attempt_count >= 0", name="ck_work_units_attempt_nonnegative"
+        ),
+    )
+
+    work_unit_id: Mapped[UUID] = mapped_column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid4)
+    task_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True), ForeignKey("research_tasks.task_id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        PostgresUUID(as_uuid=True), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False
+    )
+    work_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    objective: Mapped[str] = mapped_column(Text, nullable=False)
+    paper_ids_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    input_artifact_ids_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    dependency_ids_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    requested_worker: Mapped[str] = mapped_column(String(128), nullable=False)
+    allowed_tools_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    output_schema_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    token_budget: Mapped[int] = mapped_column(Integer, nullable=False)
+    tool_call_budget: Mapped[int] = mapped_column(Integer, nullable=False)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_artifact_id: Mapped[UUID | None] = mapped_column(PostgresUUID(as_uuid=True))
+    error: Mapped[str | None] = mapped_column(Text)
+    generation_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )

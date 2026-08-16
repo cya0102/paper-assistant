@@ -97,14 +97,25 @@ class ToolEvidenceCitationFormatter:
     def __call__(self, answer: str, tool_results: tuple[ToolResult, ...]) -> str:
         allowed: dict[str, dict[str, object]] = {}
         for result in tool_results:
-            for raw in result.payload.get("evidence", []):
+            # The Citation Manifest is authoritative; the payload scan below is
+            # only a legacy fallback for runtimes without a materializer.
+            for citation in result.citation_manifest:
+                allowed[citation.citation_label] = {
+                    "paper_title": citation.paper_title,
+                    "section_path": citation.section_path,
+                    "page_start": citation.page_start,
+                    "page_end": citation.page_end,
+                }
+            if result.citation_manifest:
+                continue
+            for raw in result.model_payload.get("evidence", []):
                 if isinstance(raw, dict) and isinstance(raw.get("citation"), str):
                     allowed[raw["citation"]] = raw
-            for raw in result.payload.get("passages", []):
+            for raw in result.model_payload.get("passages", []):
                 if not isinstance(raw, dict) or not isinstance(raw.get("citation"), str):
                     continue
                 passage = dict(raw)
-                passage.setdefault("paper_title", result.payload.get("title"))
+                passage.setdefault("paper_title", result.model_payload.get("title"))
                 allowed[raw["citation"]] = passage
         used = tuple(dict.fromkeys(self._citation.findall(answer)))
         unknown = tuple(label for label in used if label not in allowed)

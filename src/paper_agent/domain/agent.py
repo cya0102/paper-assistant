@@ -5,6 +5,8 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
+from paper_agent.domain.artifact import ArtifactReference, CitationReference
+
 
 class AgentRunStatus(StrEnum):
     RUNNING = "running"
@@ -28,10 +30,24 @@ class ToolCall:
 
 @dataclass(frozen=True, slots=True)
 class ToolResult:
+    """Compact result handed to checkpoints and Providers.
+
+    The full raw payload never travels with the checkpoint: large results are
+    offloaded to the Artifact store and only the bounded model_payload,
+    artifact_ref and citation_manifest are kept.  The payload property remains
+    as a legacy alias for the model-facing payload.
+    """
+
     call_id: str
     name: str
-    payload: dict[str, Any]
+    model_payload: dict[str, Any]
+    artifact_ref: ArtifactReference | None = None
+    citation_manifest: tuple[CitationReference, ...] = ()
     is_error: bool = False
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        return self.model_payload
 
 
 @dataclass(frozen=True, slots=True)

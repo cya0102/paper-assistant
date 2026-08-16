@@ -33,6 +33,10 @@ def test_phase1_tables_are_registered() -> None:
         "research_entity_aliases",
         "paper_relations",
         "evidence_links",
+        "research_artifacts",
+        "artifact_citations",
+        "research_tasks",
+        "work_units",
     }
 
 

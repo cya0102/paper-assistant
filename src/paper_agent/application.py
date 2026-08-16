@@ -30,6 +30,27 @@ from paper_agent.agent.tool_adapters import (
     SearchKnowledgeToolAdapter,
 )
 from paper_agent.memory import RedisCheckpointStore, RedisSessionStore
+from paper_agent.artifacts.materializer import ToolResultMaterializer
+from paper_agent.artifacts.policies import OffloadPolicy
+from paper_agent.artifacts.service import ArtifactService
+from paper_agent.agent.artifact_tool_adapters import (
+    ReadArtifactToolAdapter,
+    SearchArtifactToolAdapter,
+)
+from paper_agent.agent.delegation_tool_adapters import (
+    CollectResearchTaskToolAdapter,
+    DelegateResearchToolAdapter,
+)
+from paper_agent.delegation.collector import ResultCollector
+from paper_agent.delegation.policy import DelegationPolicy
+from paper_agent.delegation.scheduler import Scheduler
+from paper_agent.delegation.runner import WorkerRunner
+from paper_agent.research_tasks.planner import ResearchPlanner
+from paper_agent.research_tasks.service import ResearchTaskService
+from paper_agent.storage.local.artifact_blob_store import LocalArtifactBlobStore
+from paper_agent.storage.postgres.artifact_repository import SqlAlchemyArtifactRepository
+from paper_agent.storage.postgres.research_task_repository import SqlAlchemyResearchTaskRepository
+from paper_agent.workers import build_worker_registry
 from paper_agent.agent.ports import LanguageModel
 from paper_agent.providers import (
     MimoResponsesModel,
@@ -53,6 +74,18 @@ from paper_agent.research_graph import (
     ResearchGraphService,
     RuleBasedPaperProfileExtractor,
 )
+
+
+def build_artifact_service(
+    *, database_url: str, project_root: Path
+) -> ArtifactService:
+    """Assemble the local content-addressed Artifact stack for one project."""
+    engine = create_engine(database_url, pool_pre_ping=True)
+    session_factory = sessionmaker(engine, class_=Session, expire_on_commit=False)
+    return ArtifactService(
+        LocalArtifactBlobStore(project_root),
+        SqlAlchemyArtifactRepository(session_factory),
+    )
 
 
 def build_ingestion_pipeline(
@@ -125,25 +158,95 @@ def build_agent_runtime(
     redis_url: str,
     model: str,
     provider: str = "openai",
+    project_root: Path | None = None,
+    user_id: UUID | None = None,
+    session_id: UUID | None = None,
 ) -> AgentRuntime:
+    project_root = (project_root or Path.cwd()).resolve()
+    engine = create_engine(database_url, pool_pre_ping=True)
+    session_factory = sessionmaker(engine, class_=Session, expire_on_commit=False)
+    search_service = build_search_knowledge_service(database_url=database_url)
+    read_service = build_read_paper_service(database_url=database_url)
+    artifacts = ArtifactService(
+        LocalArtifactBlobStore(project_root),
+        SqlAlchemyArtifactRepository(session_factory),
+    )
+    policy = OffloadPolicy()
+    materializer = ToolResultMaterializer(artifacts, policy)
     tools = ToolRegistry()
-    tools.register(SearchKnowledgeToolAdapter(build_search_knowledge_service(database_url=database_url), project_id).contract())
-    tools.register(ReadPaperToolAdapter(build_read_paper_service(database_url=database_url), project_id).contract())
+    tools.register(SearchKnowledgeToolAdapter(search_service, project_id).contract())
+    tools.register(ReadPaperToolAdapter(read_service, project_id).contract())
     tools.register(
         ComparePapersToolAdapter(
             build_comparison_service(database_url=database_url), project_id
         ).contract()
     )
+    tools.register(ReadArtifactToolAdapter(artifacts, project_id).contract())
+    tools.register(SearchArtifactToolAdapter(artifacts, project_id).contract())
+    llm = _language_model(provider=provider, model=model)
     redis_client: Redis = Redis.from_url(redis_url, decode_responses=True)
-    engine = create_engine(database_url, pool_pre_ping=True)
-    memory_factory = sessionmaker(engine, class_=Session, expire_on_commit=False)
+    if user_id is not None:
+        task_service = build_research_task_service(
+            database_url=database_url,
+            project_root=project_root,
+            redis_url=redis_url,
+            model=llm,
+            search_service=search_service,
+            read_service=read_service,
+            artifacts=artifacts,
+            materializer=materializer,
+        )
+        tools.register(
+            DelegateResearchToolAdapter(
+                task_service, project_id, user_id, session_id
+            ).contract()
+        )
+        tools.register(
+            CollectResearchTaskToolAdapter(task_service, project_id).contract()
+        )
     return AgentRuntime(
-        _language_model(provider=provider, model=model),
+        llm,
         tools,
         RedisCheckpointStore(redis_client),
         answer_finalizer=ToolEvidenceCitationFormatter(),
         sessions=RedisSessionStore(redis_client),
-        memory=SqlAlchemyMemoryRepository(memory_factory),
+        memory=SqlAlchemyMemoryRepository(session_factory),
+        materializer=materializer,
+    )
+
+
+def build_research_task_service(
+    *,
+    database_url: str,
+    project_root: Path,
+    redis_url: str,
+    model: LanguageModel,
+    search_service: object,
+    read_service: object,
+    artifacts: ArtifactService,
+    materializer: ToolResultMaterializer,
+) -> ResearchTaskService:
+    engine = create_engine(database_url, pool_pre_ping=True)
+    session_factory = sessionmaker(engine, class_=Session, expire_on_commit=False)
+    worker_checkpoints = RedisCheckpointStore(
+        Redis.from_url(redis_url, decode_responses=True)
+    )
+    runner = WorkerRunner(
+        registry=build_worker_registry(),
+        model=model,
+        checkpoints=worker_checkpoints,
+        artifacts=artifacts,
+        materializer=materializer,
+        search_service=search_service,
+        read_service=read_service,
+    )
+    return ResearchTaskService(
+        repository=SqlAlchemyResearchTaskRepository(session_factory),
+        planner=ResearchPlanner(),
+        policy=DelegationPolicy(),
+        scheduler=Scheduler(runner),
+        collector=ResultCollector(artifacts),
+        artifacts=artifacts,
     )
 
 

@@ -12,12 +12,16 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-try:
-    settings = Settings.from_environment()
-except ValueError:
-    settings = None
-if settings is not None:
-    config.set_main_option("sqlalchemy.url", settings.database_url)
+database_url_override = config.attributes.get("database_url_override")
+if database_url_override is not None:
+    config.set_main_option("sqlalchemy.url", database_url_override)
+else:
+    try:
+        settings = Settings.from_environment()
+    except ValueError:
+        settings = None
+    if settings is not None:
+        config.set_main_option("sqlalchemy.url", settings.database_url)
 
 target_metadata = Base.metadata
 
@@ -50,4 +54,3 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
-

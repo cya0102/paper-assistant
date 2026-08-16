@@ -24,6 +24,12 @@ class ErrorCode(StrEnum):
     INDEX_FAILED = "index_failed"
     SEARCH_FAILED = "search_failed"
     CONFLICT = "conflict"
+    ARTIFACT_NOT_FOUND = "artifact_not_found"
+    ARTIFACT_EXPIRED = "artifact_expired"
+    ARTIFACT_CORRUPT = "artifact_corrupt"
+    ARTIFACT_CROSS_PROJECT = "artifact_cross_project"
+    ARTIFACT_INVALID_VIEW = "artifact_invalid_view"
+    WORK_UNIT_FAILED = "work_unit_failed"
     UNKNOWN = "unknown"
 
 

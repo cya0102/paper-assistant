@@ -6,6 +6,7 @@ from paper_agent.agent.context_builder import ContextBuilder, ContextConfig, Too
 from paper_agent.agent.runtime import AgentRuntime
 from paper_agent.agent.tools import ToolContract, ToolRegistry
 from paper_agent.domain.agent import AgentCheckpoint, AgentRunStatus, ModelTurn, ToolCall, ToolResult
+from paper_agent.domain.artifact import CitationReference
 from paper_agent.domain.enums import SearchStatus
 from paper_agent.domain.retrieval import Evidence
 from paper_agent.memory import InMemoryCheckpointStore, InMemorySessionStore
@@ -170,6 +171,25 @@ def test_context_builder_balances_papers_and_enforces_budget():
     assert context.citations[1].evidence.paper_id == second
 
 
+def _read_result(title: str, passage: dict[str, object]) -> ToolResult:
+    return ToolResult(
+        call_id="read-1",
+        name="read_paper",
+        model_payload={"title": title, "passages": [passage]},
+        citation_manifest=(
+            CitationReference(
+                citation_label=str(passage["citation"]),
+                paper_id=uuid4(),
+                version_id=uuid4(),
+                paper_title=title,
+                section_path=str(passage["section_path"]),
+                page_start=passage.get("page_start"),
+                page_end=passage.get("page_end"),
+            ),
+        ),
+    )
+
+
 def test_tool_citation_formatter_rejects_hallucinated_reference():
     formatter = ToolEvidenceCitationFormatter()
     with pytest.raises(ValueError, match="unknown citations"):
@@ -178,20 +198,14 @@ def test_tool_citation_formatter_rejects_hallucinated_reference():
 
 def test_tool_citation_formatter_accepts_read_passage_citation():
     formatter = ToolEvidenceCitationFormatter()
-    result = ToolResult(
-        call_id="read-1",
-        name="read_paper",
-        payload={
-            "title": "Scene Codebook Paper",
-            "passages": [
-                {
-                    "citation": "P123",
-                    "section_path": "3 Method > 3.2 Codebook",
-                    "page_start": 5,
-                    "page_end": 6,
-                    "text": "The codebook clusters scene features.",
-                }
-            ],
+    result = _read_result(
+        "Scene Codebook Paper",
+        {
+            "citation": "P123",
+            "section_path": "3 Method > 3.2 Codebook",
+            "page_start": 5,
+            "page_end": 6,
+            "text": "The codebook clusters scene features.",
         },
     )
     formatted = formatter("Codebook 通过聚类场景特征构建。[P123]", (result,))
@@ -201,15 +215,9 @@ def test_tool_citation_formatter_accepts_read_passage_citation():
 
 def test_tool_citation_formatter_rejects_unknown_read_citation():
     formatter = ToolEvidenceCitationFormatter()
-    result = ToolResult(
-        call_id="read-1",
-        name="read_paper",
-        payload={
-            "title": "Paper",
-            "passages": [
-                {"citation": "P123", "section_path": "Method", "page_start": 1, "page_end": 2, "text": "text"}
-            ],
-        },
+    result = _read_result(
+        "Paper",
+        {"citation": "P123", "section_path": "Method", "page_start": 1, "page_end": 2, "text": "text"},
     )
     with pytest.raises(ValueError, match="unknown citations"):
         formatter("unsupported [P999]", (result,))
@@ -217,10 +225,9 @@ def test_tool_citation_formatter_rejects_unknown_read_citation():
 
 def test_tool_citation_formatter_requires_citation_when_read_sources_exist():
     formatter = ToolEvidenceCitationFormatter()
-    result = ToolResult(
-        call_id="read-1",
-        name="read_paper",
-        payload={"title": "Paper", "passages": [{"citation": "P1", "section_path": "Method", "page_start": 1, "page_end": 2, "text": "text"}]},
+    result = _read_result(
+        "Paper",
+        {"citation": "P1", "section_path": "Method", "page_start": 1, "page_end": 2, "text": "text"},
     )
     with pytest.raises(ValueError, match="at least one citation"):
         formatter("No citation here.", (result,))
@@ -231,21 +238,26 @@ def test_tool_citation_formatter_requires_each_namespace_cited():
     search_result = ToolResult(
         call_id="search-1",
         name="search_knowledge",
-        payload={
-            "evidence": [
+        model_payload={
+            "selected_evidence": [
                 {"citation": "E123", "paper_title": "Paper", "section_path": "Method", "page_start": 1, "page_end": 2, "text": "search text"}
             ]
         },
+        citation_manifest=(
+            CitationReference(
+                citation_label="E123",
+                paper_id=uuid4(),
+                version_id=uuid4(),
+                paper_title="Paper",
+                section_path="Method",
+                page_start=1,
+                page_end=2,
+            ),
+        ),
     )
-    read_result = ToolResult(
-        call_id="read-1",
-        name="read_paper",
-        payload={
-            "title": "Paper",
-            "evidence": [
-                {"citation": "P456", "paper_title": "Paper", "section_path": "Results", "page_start": 3, "page_end": 4, "text": "read text"}
-            ],
-        },
+    read_result = _read_result(
+        "Paper",
+        {"citation": "P456", "section_path": "Results", "page_start": 3, "page_end": 4, "text": "read text"},
     )
     with pytest.raises(ValueError, match="missing"):
         formatter("Only search evidence cited.[E123]", (search_result, read_result))

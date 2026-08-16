@@ -206,6 +206,12 @@ class SqlAlchemyResearchGraphRepository:
                 **_derivation_values(profile.provenance),
             )
             session.add(row)
+            # Persist the parent before adding fields.  The mappings do not
+            # define ORM relationships, so SQLAlchemy cannot derive the
+            # parent/child flush order from object relationships.  A later
+            # Core INSERT for evidence triggers autoflush and would otherwise
+            # insert paper_profile_fields before paper_profiles.
+            session.flush()
             for value in profile.values:
                 session.add(
                     PaperProfileFieldRow(
